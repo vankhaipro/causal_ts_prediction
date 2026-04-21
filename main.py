@@ -1,54 +1,51 @@
 from causal_forecaster import CausalForecaster
 from data_loader import load_dataset
-import pandas as pd
-import numpy as np
 
 
 def main():
-    print("--- 1. Initializing Refined Causal Framework ---")
+    print("=== Causal TS Prediction — VN-Index ===\n")
+
+    # 1. Load data
+    print("--- 1. Load Data ---")
+    df = load_dataset()
+    print(f"Shape: {df.shape}")
+
     forecaster = CausalForecaster(target_col='VNINDEX_Return')
 
-    print("\n--- 2. Loading Real Data (Vietnam Stock Market, 2012-2026) ---")
-    df = load_dataset()
-    print(f"Initial dataset shape: {df.shape}")
-
-    print("\n--- 3. Preprocessing: Stationarity & Alignment ---")
-    non_stationary = forecaster.check_stationarity(df)
-    print(f"Non-stationary columns found: {len(non_stationary)}")
-    if non_stationary:
-        print(f"  → {non_stationary}")
-
-    # Publication lag: macro data thường công bố trễ 1 tháng
-    macro_cols = [c for c in df.columns if c != 'SPY_Return']
-    df = forecaster.apply_publication_lag(df, macro_cols, lag=1)
-    print(f"Data after publication lag alignment. New shape: {df.shape}")
-
-    print("\n--- 4. Dimensionality Reduction ---")
-    n_features = df.shape[1] - 1  # trừ cột target
-    if n_features >= 10:
-        df_reduced = forecaster.reduce_dimensions(df, method='lasso')
+    # 2. Stationarity check
+    print("\n--- 2. Kiểm tra Stationarity (ADF) ---")
+    non_stat = forecaster.check_stationarity(df)
+    if non_stat:
+        print(f"  Non-stationary columns: {non_stat}")
+        print("  → Log returns thường đã stationary; nếu không thì cần diff thêm.")
     else:
-        # Ít features rồi, không cần reduce
-        print(f"  Chỉ có {n_features} features, bỏ qua LASSO reduction.")
-        df_reduced = df.copy()
-    print(f"Reduced dataset shape: {df_reduced.shape}")
+        print("  Tất cả columns đã stationary. ✓")
 
-    print("\n--- 5. Causal Discovery (PC Algorithm) ---")
-    forecaster.perform_causal_discovery(df_reduced)
-    print("Causal structure learned.")
+    # 3. Causal discovery — PCMCI+ thay PC algorithm
+    #    tau_min=1 đảm bảo chỉ tìm lagged relationships X(t-τ) → Y(t),
+    #    không cần áp dụng publication lag thủ công.
+    print("\n--- 3. Causal Discovery (PCMCI+) ---")
+    forecaster.perform_causal_discovery(df, tau_max=3, pc_alpha=0.05)
 
-    print("\n--- 6. Feature Selection & Visualization ---")
-    selected = forecaster.extract_features()
-    print(f"Causal Features selected: {selected}")
+    # 4. Trích xuất causal features + visualize graph
+    print("\n--- 4. Causal Features & Graph ---")
+    causal_pairs = forecaster.extract_features()
+    print(f"  Số features nhân quả: {len(forecaster.selected_features)}")
     forecaster.visualize_graph()
 
-    print("\n--- 7. Rolling Window Forecasting ---")
-    # Window 60 tháng (~5 năm) phù hợp với 190 tháng dữ liệu thực
-    window = min(60, len(df_reduced) // 3)
-    actuals, predictions = forecaster.forecast_rolling_window(df_reduced, window_size=window)
+    # 5. So sánh 3 baselines với rolling window
+    print("\n--- 5. Model Comparison (Rolling Window) ---")
+    window = min(60, len(df) // 3)
+    print(f"  Window size: {window} tháng")
+    results = forecaster.compare_models(df, window_size=window)
 
-    print("\n--- 8. Evaluation ---")
-    forecaster.evaluate(actuals, predictions)
+    # 6. Tổng kết
+    print("\n=== KẾT QUẢ TỔNG KẾT ===")
+    print(f"{'Model':<30} {'MSE':>10} {'MAE':>10} {'Dir.Acc':>10}")
+    print("-" * 62)
+    for res in results.values():
+        if res:
+            print(f"{res['model']:<30} {res['mse']:>10.6f} {res['mae']:>10.6f} {res['da']:>10.2%}")
 
 
 if __name__ == "__main__":
