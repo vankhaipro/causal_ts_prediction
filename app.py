@@ -93,10 +93,6 @@ for key in ["df", "forecaster", "causal_pairs", "results"]:
 # Header
 # ------------------------------------------------------------------
 st.title("📈 Causal TS Prediction — VN-Index")
-st.caption(
-    "Dự báo VN-Index bằng Causal Discovery (PCMCI+) + Ridge / LSTM  "
-    "| Khoá luận tốt nghiệp ngành AI"
-)
 
 # ------------------------------------------------------------------
 # Tabs
