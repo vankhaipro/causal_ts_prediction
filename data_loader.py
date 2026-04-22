@@ -276,6 +276,13 @@ def load_dataset(use_cache: bool = True, freq: str = "monthly") -> pd.DataFrame:
     # Loại hàng còn NaN
     df = df.dropna()
 
+    # Thêm volatility features từ VNINDEX_Return
+    # Vol5/Vol20 = rolling std 5/20 kỳ — capture chế độ biến động thị trường
+    if "VNINDEX_Return" in df.columns:
+        df["VNINDEX_Vol5"]  = df["VNINDEX_Return"].rolling(5).std()
+        df["VNINDEX_Vol20"] = df["VNINDEX_Return"].rolling(20).std()
+        df = df.dropna()
+
     # Đảm bảo VNINDEX_Return là cột cuối (target)
     cols = [c for c in df.columns if c != "VNINDEX_Return"] + ["VNINDEX_Return"]
     df = df[cols]
