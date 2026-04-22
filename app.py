@@ -496,3 +496,160 @@ with tab4:
             plt.tight_layout()
             st.pyplot(fig_hist, use_container_width=True)
             plt.close(fig_hist)
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 5 — Khuyến nghị cổ phiếu
+# ══════════════════════════════════════════════════════════════════
+with tab5:
+    st.subheader("5. Khuyến nghị cổ phiếu — Dự báo giá kỳ tiếp theo")
+
+    if st.session_state.df is None:
+        st.warning("Vui lòng tải dữ liệu ở tab **Dữ liệu** trước.")
+    else:
+        df = st.session_state.df
+        forecaster_tmp = st.session_state.forecaster or CausalForecaster(target_col="VNINDEX_Return")
+
+        st.info(
+            f"Model dự báo **log return** kỳ tiếp theo cho từng mã, "
+            f"sau đó tính **giá dự báo = giá hiện tại × exp(predicted return)**. "
+            f"Causal parents từ PCMCI+ được dùng làm features (nếu đã chạy)."
+        )
+
+        # Ngưỡng MUA/BÁN
+        col_th1, col_th2 = st.columns(2)
+        with col_th1:
+            buy_threshold = st.number_input(
+                "Ngưỡng MUA (return tối thiểu)",
+                min_value=0.001, max_value=0.05,
+                value=0.005 if freq == "daily" else 0.01,
+                step=0.001, format="%.3f",
+                help="Return dự báo ≥ ngưỡng này → khuyến nghị MUA"
+            )
+        with col_th2:
+            sell_threshold = st.number_input(
+                "Ngưỡng BÁN (return tối đa)",
+                min_value=-0.05, max_value=-0.001,
+                value=-0.005 if freq == "daily" else -0.01,
+                step=0.001, format="%.3f",
+                help="Return dự báo ≤ ngưỡng này → khuyến nghị BÁN"
+            )
+
+        predict_stocks_btn = st.button("💹 Phân tích & Dự báo tất cả cổ phiếu", type="primary")
+
+        if predict_stocks_btn:
+            with st.spinner("Đang tải giá hiện tại và tính dự báo..."):
+                latest_prices = get_latest_prices(freq=freq)
+
+                if latest_prices.empty:
+                    st.error("Không lấy được giá hiện tại. Thử tải lại dữ liệu với use_cache=False.")
+                else:
+                    df_rec = forecaster_tmp.predict_all_stocks(
+                        df,
+                        latest_prices,
+                        window_size=window_size,
+                        buy_threshold=buy_threshold,
+                        sell_threshold=sell_threshold,
+                    )
+                    st.session_state["stock_recommendations"] = df_rec
+
+        if st.session_state.get("stock_recommendations") is not None:
+            df_rec = st.session_state["stock_recommendations"]
+
+            # Tổng quan khuyến nghị
+            n_buy  = (df_rec["Khuyến nghị"].str.contains("MUA")).sum()
+            n_sell = (df_rec["Khuyến nghị"].str.contains("BÁN")).sum()
+            n_hold = (df_rec["Khuyến nghị"].str.contains("GIỮ")).sum()
+            last_date = df.index[-1].date()
+
+            st.markdown(f"### Tổng quan — Kỳ tiếp theo sau {last_date}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("🟢 Khuyến nghị MUA", n_buy)
+            c2.metric("🟡 Khuyến nghị GIỮ", n_hold)
+            c3.metric("🔴 Khuyến nghị BÁN", n_sell)
+
+            st.divider()
+
+            # Bảng khuyến nghị chi tiết
+            st.markdown("**Chi tiết từng mã**")
+            for _, row in df_rec.iterrows():
+                with st.container():
+                    cols = st.columns([1, 1.5, 1.5, 1.5, 1.5, 2, 1.5])
+                    cols[0].markdown(f"**{row['Mã']}**")
+                    cols[1].metric("Giá hiện tại", f"{row['Giá hiện tại']:,.0f}")
+                    cols[2].metric(
+                        "Giá dự báo",
+                        f"{row['Giá dự báo']:,.0f}",
+                        delta=f"{row['Thay đổi (%)']:+.2f}%",
+                        delta_color="normal" if row["Thay đổi (%)"] >= 0 else "inverse",
+                    )
+                    cols[3].metric("Return dự báo", f"{row['Predicted Return']:+.4f}")
+                    cols[4].markdown(f"**{row['Khuyến nghị']}**")
+                    cols[5].progress(
+                        int(row["Độ tin cậy"]),
+                        text=f"Tin cậy: {row['Độ tin cậy']:.0f}%"
+                    )
+                st.divider()
+
+            # Biểu đồ giá hiện tại vs dự báo
+            st.markdown("**Biểu đồ so sánh Giá hiện tại vs Giá dự báo**")
+            fig_price, ax_price = plt.subplots(figsize=(12, 5))
+            x = np.arange(len(df_rec))
+            w = 0.35
+            bar1 = ax_price.bar(x - w/2, df_rec["Giá hiện tại"], w,
+                                 label="Giá hiện tại", color="#4C72B0", alpha=0.8)
+            bar2 = ax_price.bar(x + w/2, df_rec["Giá dự báo"], w,
+                                 label="Giá dự báo", color="#C44E52", alpha=0.8)
+            ax_price.set_xticks(x)
+            ax_price.set_xticklabels(df_rec["Mã"], fontsize=11)
+            ax_price.set_ylabel("Giá (VND)")
+            ax_price.set_title(f"Giá hiện tại vs Dự báo kỳ tiếp theo", fontsize=12)
+            ax_price.legend()
+            ax_price.grid(True, linestyle=':', alpha=0.4, axis='y')
+            for bar in bar2:
+                h = bar.get_height()
+                ax_price.text(bar.get_x() + bar.get_width()/2, h * 1.005,
+                              f"{h:,.0f}", ha='center', va='bottom', fontsize=7)
+            plt.tight_layout()
+            st.pyplot(fig_price, use_container_width=True)
+            plt.close(fig_price)
+
+            # Lịch sử 30 kỳ gần nhất cho mã được chọn
+            st.divider()
+            st.markdown("**Lịch sử giá mã cụ thể**")
+            symbols_available = df_rec["Mã"].tolist()
+            selected_sym = st.selectbox("Chọn mã cổ phiếu", symbols_available)
+
+            if selected_sym and selected_sym in df.columns:
+                price_file = DATA_DIR / f"prices{'_daily' if freq == 'daily' else ''}.csv"
+                if price_file.exists():
+                    df_prices = pd.read_csv(price_file, index_col=0, parse_dates=True)
+                    if selected_sym in df_prices.columns:
+                        recent_prices = df_prices[selected_sym].dropna().tail(60)
+                        pred_row = df_rec[df_rec["Mã"] == selected_sym].iloc[0]
+
+                        fig_sym, ax_sym = plt.subplots(figsize=(12, 4))
+                        ax_sym.plot(recent_prices.index, recent_prices.values,
+                                    color="#4C72B0", linewidth=1.5, label=f"{selected_sym} giá thực")
+                        # Thêm điểm dự báo
+                        last_real_date = recent_prices.index[-1]
+                        ax_sym.scatter([last_real_date], [pred_row["Giá hiện tại"]],
+                                       color="#4C72B0", s=60, zorder=5)
+                        ax_sym.scatter(
+                            [last_real_date], [pred_row["Giá dự báo"]],
+                            color="#C44E52", s=120, zorder=6,
+                            marker="*", label=f"Dự báo: {pred_row['Giá dự báo']:,.0f}"
+                        )
+                        ax_sym.set_ylabel("Giá đóng cửa (VND)")
+                        ax_sym.set_title(f"{selected_sym} — Lịch sử & Dự báo kỳ tiếp theo", fontsize=12)
+                        ax_sym.legend()
+                        ax_sym.grid(True, linestyle=':', alpha=0.4)
+                        plt.xticks(rotation=30, ha='right', fontsize=7)
+                        plt.tight_layout()
+                        st.pyplot(fig_sym, use_container_width=True)
+                        plt.close(fig_sym)
+
+            st.caption(
+                "⚠️ **Tuyên bố miễn trách:** Đây là dự báo từ mô hình học máy phục vụ mục đích "
+                "nghiên cứu học thuật, KHÔNG phải tư vấn đầu tư. "
+                "Thị trường chứng khoán có rủi ro cao — luôn tự nghiên cứu trước khi đầu tư."
+            )
