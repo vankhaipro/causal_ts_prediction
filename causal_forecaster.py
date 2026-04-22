@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import networkx as nx
 from tigramite import data_processing as pp
@@ -11,12 +13,41 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from statsmodels.tsa.stattools import adfuller
 
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+
+# ------------------------------------------------------------------
+# LSTM Model (PyTorch)
+# ------------------------------------------------------------------
+
+class _LSTMNet(nn.Module if TORCH_AVAILABLE else object):
+    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True, dropout=dropout
+        )
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :]).squeeze(-1)
+
+
+# ------------------------------------------------------------------
+# CausalForecaster
+# ------------------------------------------------------------------
 
 class CausalForecaster:
     def __init__(self, target_col='VNINDEX_Return'):
         self.target_col = target_col
         self.pcmci_results = None
-        self.selected_features = []   # feature names confirmed causal by PCMCI+
+        self.selected_features = []
         self.feature_names = None
 
     # ------------------------------------------------------------------
@@ -68,12 +99,9 @@ class CausalForecaster:
     def perform_causal_discovery(self, df, tau_max=3, pc_alpha=0.05):
         """
         Chạy PCMCI+ để học cấu trúc nhân quả có độ trễ.
-
-        tau_min=1 đảm bảo chỉ tìm X(t-tau) → Y(t), tránh look-ahead bias
-        hoàn toàn bằng cách thiết kế (không cần publication lag thủ công).
+        tau_min=1 đảm bảo chỉ tìm X(t-tau) → Y(t), tránh look-ahead bias.
         """
         self.feature_names = df.columns.tolist()
-
         dataframe = pp.DataFrame(
             df.values.astype(float),
             var_names=self.feature_names
@@ -92,14 +120,11 @@ class CausalForecaster:
         return self.pcmci_results
 
     def extract_features(self):
-        """
-        Trích xuất features có cạnh nhân quả --> target.
-        Trả về list (feature_name, lag) và lưu feature names vào self.selected_features.
-        """
+        """Trích xuất features có cạnh nhân quả --> target."""
         if self.pcmci_results is None:
             raise ValueError("Chạy perform_causal_discovery trước.")
 
-        graph = self.pcmci_results['graph']   # shape: (n_vars, n_vars, tau_max+1)
+        graph = self.pcmci_results['graph']
         target_idx = self.feature_names.index(self.target_col)
 
         causal_pairs = []
@@ -117,51 +142,54 @@ class CausalForecaster:
         print(f"Causal features → {self.target_col}: {causal_pairs}")
         return causal_pairs
 
-    def visualize_graph(self):
-        """Vẽ causal graph với nhãn độ trễ (τ)."""
+    def build_causal_graph(self):
+        """Trả về NetworkX DiGraph từ kết quả PCMCI+."""
         if self.pcmci_results is None:
-            return
-
+            return None
         graph = self.pcmci_results['graph']
         G = nx.DiGraph()
         for feat in self.feature_names:
             G.add_node(feat)
-
         for i, src in enumerate(self.feature_names):
             for j, dst in enumerate(self.feature_names):
                 for tau in range(graph.shape[2]):
                     if graph[i, j, tau] == '-->':
-                        # Nếu đã có cạnh, gộp nhãn lag
                         if G.has_edge(src, dst):
                             G[src][dst]['label'] += f',τ={tau}'
                         else:
                             G.add_edge(src, dst, label=f'τ={tau}')
+        return G
 
-        plt.figure(figsize=(14, 9))
+    def visualize_graph(self, freq: str = "monthly"):
+        """Vẽ causal graph với nhãn độ trễ (τ)."""
+        G = self.build_causal_graph()
+        if G is None:
+            return
+
+        unit = "ngày" if freq == "daily" else "tháng"
+        fig, ax = plt.subplots(figsize=(14, 9))
         pos = nx.spring_layout(G, k=0.8, seed=42)
         colors = ['#FF4B4B' if n == self.target_col else '#1E90FF' for n in G.nodes()]
         nx.draw(G, pos, with_labels=True, node_color=colors,
                 node_size=2500, font_size=9, font_weight='bold',
-                arrows=True, arrowsize=20, edge_color='gray', alpha=0.85)
-        nx.draw_networkx_edge_labels(G, pos, nx.get_edge_attributes(G, 'label'), font_size=7)
-        plt.title(f"PCMCI+ Causal Graph — {self.target_col}", fontsize=14)
+                arrows=True, arrowsize=20, edge_color='gray', alpha=0.85, ax=ax)
+        nx.draw_networkx_edge_labels(G, pos, nx.get_edge_attributes(G, 'label'),
+                                     font_size=7, ax=ax)
+        ax.set_title(f"PCMCI+ Causal Graph — {self.target_col} ({unit})", fontsize=14)
         plt.tight_layout()
-        plt.savefig('causal_graph.png', dpi=150, bbox_inches='tight')
-        plt.show()
-        print("Đã lưu: causal_graph.png")
+        suffix = "_daily" if freq == "daily" else ""
+        fname = f"causal_graph{suffix}.png"
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Đã lưu: {fname}")
+        return fig
 
     # ------------------------------------------------------------------
-    # Forecasting
+    # Forecasting — Ridge (Rolling Window)
     # ------------------------------------------------------------------
 
     def _rolling_forecast(self, df, feature_cols, window_size=60):
-        """
-        Rolling window Ridge Regression.
-
-        Dùng lag-1 của feature_cols (shift 1 tháng) để dự báo target(t).
-        Việc shift được thực hiện ở đây — KHÔNG áp dụng publication lag
-        bên ngoài trước khi gọi hàm này.
-        """
+        """Rolling window Ridge Regression. Shift-1 được áp dụng nội bộ."""
         df_lag = df[feature_cols].shift(1).copy()
         df_lag[self.target_col] = df[self.target_col]
         df_lag = df_lag.dropna()
@@ -171,8 +199,9 @@ class CausalForecaster:
 
         predictions, actuals = [], []
         for i in range(window_size, len(df_lag)):
-            X_train, y_train = X[i - window_size:i], y[i - window_size:i]
-            X_test, y_test   = X[i:i + 1],           y[i:i + 1]
+            X_train = X[i - window_size:i]
+            y_train = y[i - window_size:i]
+            X_test  = X[i:i + 1]
 
             scaler = StandardScaler()
             X_train_s = scaler.fit_transform(X_train)
@@ -180,9 +209,224 @@ class CausalForecaster:
 
             pred = Ridge(alpha=1.0).fit(X_train_s, y_train).predict(X_test_s)[0]
             predictions.append(pred)
-            actuals.append(y_test[0])
+            actuals.append(y[i])
 
         return np.array(actuals), np.array(predictions)
+
+    # ------------------------------------------------------------------
+    # Forecasting — LSTM (Rolling Window, PyTorch)
+    # ------------------------------------------------------------------
+
+    def _rolling_forecast_lstm(self, df, feature_cols, window_size=60,
+                                seq_len=10, epochs=30, hidden_size=64,
+                                num_layers=2, lr=1e-3, verbose=False):
+        """
+        Rolling window LSTM Regression.
+
+        Mỗi bước: dùng window_size quan sát gần nhất để train LSTM,
+        dự báo bước tiếp theo bằng seq_len observations cuối.
+        """
+        if not TORCH_AVAILABLE:
+            print("  [WARNING] torch không khả dụng, bỏ qua LSTM.")
+            return None, None
+
+        df_lag = df[feature_cols].shift(1).copy()
+        df_lag[self.target_col] = df[self.target_col]
+        df_lag = df_lag.dropna()
+
+        y = df_lag[self.target_col].values.astype(np.float32)
+        X = df_lag[feature_cols].values.astype(np.float32)
+        n_features = X.shape[1]
+
+        def make_sequences(X_w, y_w, seq_len):
+            """Tạo sequences (X_seq, y_seq) từ window."""
+            xs, ys = [], []
+            for k in range(seq_len, len(X_w)):
+                xs.append(X_w[k - seq_len:k])
+                ys.append(y_w[k])
+            return np.array(xs), np.array(ys)
+
+        predictions, actuals = [], []
+        device = torch.device('cpu')
+
+        for i in range(window_size, len(df_lag)):
+            X_train_raw = X[i - window_size:i]
+            y_train_raw = y[i - window_size:i]
+
+            scaler = StandardScaler()
+            X_train_s = scaler.fit_transform(X_train_raw).astype(np.float32)
+            X_test_s  = scaler.transform(X[i:i + 1]).astype(np.float32)
+
+            # Scale target
+            y_mean, y_std = y_train_raw.mean(), y_train_raw.std() + 1e-8
+            y_train_s = ((y_train_raw - y_mean) / y_std).astype(np.float32)
+
+            X_seq, y_seq = make_sequences(X_train_s, y_train_s, seq_len)
+            if len(X_seq) == 0:
+                actuals.append(y[i])
+                predictions.append(0.0)
+                continue
+
+            # Build last sequence for prediction
+            last_seq = np.vstack([X_train_s[-(seq_len - 1):], X_test_s])
+            last_seq = torch.tensor(last_seq[np.newaxis], dtype=torch.float32)
+
+            X_t = torch.tensor(X_seq, dtype=torch.float32)
+            y_t = torch.tensor(y_seq, dtype=torch.float32)
+
+            model = _LSTMNet(n_features, hidden_size, num_layers).to(device)
+            opt   = torch.optim.Adam(model.parameters(), lr=lr)
+            loss_fn = nn.MSELoss()
+
+            model.train()
+            for _ in range(epochs):
+                opt.zero_grad()
+                loss_fn(model(X_t), y_t).backward()
+                opt.step()
+
+            model.eval()
+            with torch.no_grad():
+                pred_s = model(last_seq).item()
+
+            pred = pred_s * y_std + y_mean
+            predictions.append(pred)
+            actuals.append(y[i])
+
+            if verbose and (i - window_size) % 50 == 0:
+                print(f"    LSTM step {i - window_size}/{len(df_lag) - window_size}")
+
+        return np.array(actuals), np.array(predictions)
+
+    def forecast_next(self, df, feature_cols, window_size=60):
+        """Dự báo kỳ tiếp theo bằng Ridge dùng toàn bộ dữ liệu cuối."""
+        df_lag = df[feature_cols].shift(1).copy()
+        df_lag[self.target_col] = df[self.target_col]
+        df_lag = df_lag.dropna()
+
+        X = df_lag[feature_cols].values
+        y = df_lag[self.target_col].values
+
+        X_train = X[-window_size:]
+        y_train = y[-window_size:]
+
+        # Features cho kỳ tiếp theo = giá trị hiện tại (chưa shift)
+        X_next = df[feature_cols].values[-1:]
+
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_next_s  = scaler.transform(X_next)
+
+        pred = Ridge(alpha=1.0).fit(X_train_s, y_train).predict(X_next_s)[0]
+        return float(pred)
+
+    def predict_all_stocks(self, df: pd.DataFrame, latest_prices: pd.Series,
+                           window_size: int = 60,
+                           buy_threshold: float = 0.003,
+                           sell_threshold: float = -0.003) -> pd.DataFrame:
+        """
+        Dự báo giá kỳ tiếp theo cho từng cổ phiếu trong dataset.
+
+        Với mỗi cổ phiếu S:
+          1. Tìm causal parents của S trong PCMCI+ graph (nếu đã chạy)
+             Fallback: dùng tất cả features còn lại
+          2. Fit Ridge trên window_size kỳ gần nhất
+          3. Dự báo predicted_return → predicted_price = latest_price × exp(ret)
+          4. Đưa ra khuyến nghị MUA / BÁN / GIỮ
+
+        Returns: DataFrame với các cột:
+            Mã, Giá hiện tại, Giá dự báo, Thay đổi (%), Khuyến nghị, Độ tin cậy
+        """
+        all_symbols = [c for c in df.columns if c != "VNINDEX_Return"]
+        rows = []
+
+        for symbol in all_symbols:
+            if symbol not in df.columns:
+                continue
+
+            # Tìm causal parents từ graph (nếu có)
+            feature_cols = self._get_causal_parents(symbol, df)
+
+            # Dự báo return kỳ tiếp theo
+            try:
+                pred_return = self._forecast_single(df, symbol, feature_cols, window_size)
+            except Exception:
+                pred_return = 0.0
+
+            # Giá hiện tại
+            current_price = latest_prices.get(symbol, np.nan)
+            if np.isnan(current_price) or current_price <= 0:
+                continue
+
+            # Giá dự báo
+            predicted_price = current_price * np.exp(pred_return)
+            change_pct = (predicted_price - current_price) / current_price * 100
+
+            # Khuyến nghị
+            if pred_return >= buy_threshold:
+                signal = "🟢 MUA"
+                confidence = min(abs(pred_return) / (buy_threshold * 3), 1.0)
+            elif pred_return <= sell_threshold:
+                signal = "🔴 BÁN"
+                confidence = min(abs(pred_return) / (abs(sell_threshold) * 3), 1.0)
+            else:
+                signal = "🟡 GIỮ"
+                confidence = 1.0 - abs(pred_return) / buy_threshold
+
+            rows.append({
+                "Mã": symbol,
+                "Giá hiện tại": round(current_price, 2),
+                "Giá dự báo": round(predicted_price, 2),
+                "Thay đổi (%)": round(change_pct, 2),
+                "Predicted Return": round(pred_return, 5),
+                "Khuyến nghị": signal,
+                "Độ tin cậy": round(confidence * 100, 1),
+            })
+
+        return pd.DataFrame(rows)
+
+    def _get_causal_parents(self, symbol: str, df: pd.DataFrame) -> list:
+        """Trả về danh sách causal parents của symbol từ PCMCI+ graph."""
+        if self.pcmci_results is None or symbol not in self.feature_names:
+            # Fallback: tất cả features trừ chính nó
+            return [c for c in df.columns if c != symbol]
+
+        graph = self.pcmci_results['graph']
+        target_idx = self.feature_names.index(symbol)
+        parents = set()
+        for i, feat in enumerate(self.feature_names):
+            if feat == symbol:
+                continue
+            for tau in range(graph.shape[2]):
+                if graph[i, target_idx, tau] == '-->':
+                    parents.add(feat)
+        # Fallback nếu không có causal parents
+        return list(parents) if parents else [c for c in df.columns if c != symbol]
+
+    def _forecast_single(self, df: pd.DataFrame, target: str,
+                         feature_cols: list, window_size: int) -> float:
+        """Ridge forecast kỳ tiếp theo cho một target bất kỳ."""
+        available = [c for c in feature_cols if c in df.columns]
+        if not available:
+            return 0.0
+
+        df_lag = df[available].shift(1).copy()
+        df_lag[target] = df[target]
+        df_lag = df_lag.dropna()
+
+        if len(df_lag) < window_size:
+            window_size = len(df_lag) // 2
+
+        X = df_lag[available].values
+        y = df_lag[target].values
+        X_train = X[-window_size:]
+        y_train = y[-window_size:]
+        X_next  = df[available].values[-1:]
+
+        scaler = StandardScaler()
+        pred = Ridge(alpha=1.0).fit(
+            scaler.fit_transform(X_train), y_train
+        ).predict(scaler.transform(X_next))[0]
+        return float(pred)
 
     # ------------------------------------------------------------------
     # Evaluation & Comparison
@@ -190,7 +434,7 @@ class CausalForecaster:
 
     @staticmethod
     def directional_accuracy(actuals, predictions):
-        """Tỷ lệ dự báo đúng chiều (tăng/giảm) — metric thực tế trong finance."""
+        """% dự báo đúng chiều tăng/giảm."""
         return float(np.mean(np.sign(actuals) == np.sign(predictions)))
 
     def evaluate(self, actuals, predictions, model_name='Model'):
@@ -201,15 +445,14 @@ class CausalForecaster:
         return {'model': model_name, 'mse': mse, 'mae': mae, 'da': da,
                 'actuals': actuals, 'predictions': predictions}
 
-    def compare_models(self, df, window_size=60):
+    def compare_models(self, df, window_size=60, freq: str = "monthly",
+                       use_lstm: bool = False, lstm_epochs: int = 20):
         """
-        So sánh 3 baseline:
-          1. All-features Ridge   — tất cả features
-          2. LASSO Ridge          — LASSO-selected features
-          3. Causal Ridge         — PCMCI+-selected features
-
-        Lưu ý: LASSO được fit trên toàn bộ dataset (ngoài rolling window),
-        đây là cách tiêu chuẩn cho feature selection nhưng cần ghi chú trong báo cáo.
+        So sánh các baseline:
+          1. All-features Ridge
+          2. LASSO Ridge
+          3. Causal Ridge (PCMCI+)
+          4. Causal LSTM (PCMCI+ features, nếu use_lstm=True)
         """
         all_cols = [c for c in df.columns if c != self.target_col]
 
@@ -224,21 +467,34 @@ class CausalForecaster:
         r_lasso = self.evaluate(act, pred_lasso, 'LASSO Ridge')
 
         print("\n[3/3] Causal Ridge (PCMCI+)")
+        r_causal = None
         if self.selected_features:
             _, pred_causal = self._rolling_forecast(df, self.selected_features, window_size)
             r_causal = self.evaluate(act, pred_causal, 'Causal Ridge (PCMCI+)')
         else:
             print("  Không tìm được causal features.")
-            r_causal = None
 
-        results = {'all': r_all, 'lasso': r_lasso, 'causal': r_causal}
-        self._plot_comparison(results, act)
+        r_lstm = None
+        if use_lstm and TORCH_AVAILABLE and self.selected_features:
+            print(f"\n[4/4] Causal LSTM (PCMCI+, epochs={lstm_epochs})")
+            seq_len = min(10, window_size // 6)
+            act_lstm, pred_lstm = self._rolling_forecast_lstm(
+                df, self.selected_features,
+                window_size=window_size,
+                seq_len=seq_len,
+                epochs=lstm_epochs,
+            )
+            if act_lstm is not None:
+                r_lstm = self.evaluate(act_lstm, pred_lstm, 'Causal LSTM (PCMCI+)')
+
+        results = {'all': r_all, 'lasso': r_lasso, 'causal': r_causal, 'lstm': r_lstm}
+        self._plot_comparison(results, act, freq=freq)
         return results
 
-    def _plot_comparison(self, results, actuals):
+    def _plot_comparison(self, results, actuals, freq: str = "monthly"):
+        unit = "Ngày" if freq == "daily" else "Tháng"
         fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
-        # --- Time series ---
         ax = axes[0]
         ax.plot(actuals, label='Actual', color='black', linewidth=1.5)
         ax.plot(results['all']['predictions'],
@@ -248,16 +504,20 @@ class CausalForecaster:
         if results['causal']:
             ax.plot(results['causal']['predictions'],
                     label='Causal Ridge (PCMCI+)', color='#C44E52', linewidth=2)
-        ax.set_title('VN-Index Monthly Return: Model Comparison', fontsize=13)
+        if results.get('lstm'):
+            ax.plot(results['lstm']['predictions'],
+                    label='Causal LSTM (PCMCI+)', color='#FF7F0E', linewidth=2, linestyle='-.')
+        ax.set_title(f'VN-Index {unit}ly Return: Model Comparison', fontsize=13)
         ax.set_ylabel('Log Return')
         ax.legend()
         ax.grid(True, linestyle=':', alpha=0.5)
 
-        # --- Metrics bar chart ---
         ax2 = axes[1]
         models_data = [('All-features', results['all']), ('LASSO', results['lasso'])]
         if results['causal']:
             models_data.append(('Causal\n(PCMCI+)', results['causal']))
+        if results.get('lstm'):
+            models_data.append(('Causal\nLSTM', results['lstm']))
 
         names = [m[0] for m in models_data]
         mses  = [m[1]['mse'] for m in models_data]
@@ -277,6 +537,9 @@ class CausalForecaster:
         ax2b.legend(loc='upper right')
 
         plt.tight_layout()
-        plt.savefig('model_comparison.png', dpi=150, bbox_inches='tight')
-        plt.show()
-        print("Đã lưu: model_comparison.png")
+        suffix = "_daily" if freq == "daily" else ""
+        fname = f"model_comparison{suffix}.png"
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Đã lưu: {fname}")
+        return fig

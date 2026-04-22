@@ -1,16 +1,46 @@
+"""
+Pipeline chính — Causal TS Prediction VN-Index
+
+Cách chạy:
+  python main.py              # dùng dữ liệu monthly (mặc định)
+  python main.py daily        # dùng dữ liệu daily
+  python main.py monthly      # dùng dữ liệu monthly (tường minh)
+"""
+
+import sys
 from causal_forecaster import CausalForecaster
 from data_loader import load_dataset
 
 
-def main():
-    print("=== Causal TS Prediction — VN-Index ===\n")
+# ------------------------------------------------------------------
+# Cấu hình theo tần suất
+# ------------------------------------------------------------------
+FREQ_CONFIG = {
+    "monthly": {
+        "tau_max":     3,    # lag tối đa: 3 tháng
+        "pc_alpha":    0.05,
+        "window_size": 60,   # rolling window: 60 tháng (~5 năm)
+        "unit":        "tháng",
+    },
+    "daily": {
+        "tau_max":     5,    # lag tối đa: 5 ngày giao dịch (1 tuần)
+        "pc_alpha":    0.01, # alpha chặt hơn vì nhiều quan sát hơn
+        "window_size": 252,  # rolling window: 252 ngày (~1 năm giao dịch)
+        "unit":        "ngày",
+    },
+}
+
+
+def main(freq: str = "monthly"):
+    cfg = FREQ_CONFIG[freq]
+    print(f"=== Causal TS Prediction — VN-Index ({freq}) ===\n")
 
     # 1. Load data
     print("--- 1. Load Data ---")
-    df = load_dataset()
-    print(f"Shape: {df.shape}")
+    df = load_dataset(freq=freq)
+    print(f"  Shape: {df.shape}")
 
-    forecaster = CausalForecaster(target_col='VNINDEX_Return')
+    forecaster = CausalForecaster(target_col="VNINDEX_Return")
 
     # 2. Stationarity check
     print("\n--- 2. Kiểm tra Stationarity (ADF) ---")
@@ -21,23 +51,25 @@ def main():
     else:
         print("  Tất cả columns đã stationary. ✓")
 
-    # 3. Causal discovery — PCMCI+ thay PC algorithm
-    #    tau_min=1 đảm bảo chỉ tìm lagged relationships X(t-τ) → Y(t),
-    #    không cần áp dụng publication lag thủ công.
-    print("\n--- 3. Causal Discovery (PCMCI+) ---")
-    forecaster.perform_causal_discovery(df, tau_max=3, pc_alpha=0.05)
+    # 3. Causal discovery — PCMCI+
+    #    tau_min=1 đảm bảo chỉ tìm X(t-τ) → Y(t), không look-ahead bias.
+    print(f"\n--- 3. Causal Discovery (PCMCI+, tau_max={cfg['tau_max']}) ---")
+    forecaster.perform_causal_discovery(
+        df,
+        tau_max=cfg["tau_max"],
+        pc_alpha=cfg["pc_alpha"],
+    )
 
     # 4. Trích xuất causal features + visualize graph
     print("\n--- 4. Causal Features & Graph ---")
     causal_pairs = forecaster.extract_features()
     print(f"  Số features nhân quả: {len(forecaster.selected_features)}")
-    forecaster.visualize_graph()
+    forecaster.visualize_graph(freq=freq)
 
     # 5. So sánh 3 baselines với rolling window
-    print("\n--- 5. Model Comparison (Rolling Window) ---")
-    window = min(60, len(df) // 3)
-    print(f"  Window size: {window} tháng")
-    results = forecaster.compare_models(df, window_size=window)
+    window = min(cfg["window_size"], len(df) // 3)
+    print(f"\n--- 5. Model Comparison (Rolling Window = {window} {cfg['unit']}) ---")
+    results = forecaster.compare_models(df, window_size=window, freq=freq)
 
     # 6. Tổng kết
     print("\n=== KẾT QUẢ TỔNG KẾT ===")
@@ -45,8 +77,17 @@ def main():
     print("-" * 62)
     for res in results.values():
         if res:
-            print(f"{res['model']:<30} {res['mse']:>10.6f} {res['mae']:>10.6f} {res['da']:>10.2%}")
+            print(
+                f"{res['model']:<30} "
+                f"{res['mse']:>10.6f} "
+                f"{res['mae']:>10.6f} "
+                f"{res['da']:>10.2%}"
+            )
 
 
 if __name__ == "__main__":
-    main()
+    freq_arg = sys.argv[1] if len(sys.argv) > 1 else "monthly"
+    if freq_arg not in FREQ_CONFIG:
+        print(f"Tần suất không hợp lệ: '{freq_arg}'. Dùng 'daily' hoặc 'monthly'.")
+        sys.exit(1)
+    main(freq_arg)

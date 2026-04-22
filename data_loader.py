@@ -1,9 +1,11 @@
 """
 Data Loader - Thị trường chứng khoán Việt Nam + Macro toàn cầu
-Nguồn 1: vnstock (KBS)  — VN-Index + 9 blue-chip VN
-Nguồn 2: yfinance       — S&P500, VIX, Giá dầu Brent, Tỷ giá USD/VND
+Nguồn 1: vnstock (KBS)  — VN-Index + blue-chip VN
+Nguồn 2: yfinance       — S&P500, VIX, Giá dầu Brent, Gold, DXY
 
-Dữ liệu được lưu vào thư mục Data/ dưới dạng CSV.
+Hỗ trợ 2 tần suất:
+  freq="daily"   → dữ liệu ngày giao dịch (lưu Data/dataset_daily.csv)
+  freq="monthly" → dữ liệu tháng (lưu Data/dataset.csv)
 """
 
 import pandas as pd
@@ -15,7 +17,7 @@ import yfinance as yf
 # ------------------------------------------------------------------
 # Cấu hình
 # ------------------------------------------------------------------
-START_DATE = "2012-01-01"
+START_DATE = "2015-01-01"   # KBS chỉ có từ ~2015 cho hầu hết mã
 END_DATE   = "2026-04-01"
 DATA_DIR   = Path(__file__).parent / "Data"
 
@@ -33,21 +35,26 @@ VN_SYMBOLS = {
     # VHM (Vinhomes)    IPO 2018 — bỏ cùng lý do
 }
 
-# Yahoo Finance tickers cho macro features
-# USDVND bỏ ra vì ticker VNDUSD=X trên Yahoo không đáng tin (dữ liệu nhiễu)
-# Thay bằng USDJPY và Gold làm proxy rủi ro toàn cầu
 MACRO_SYMBOLS = {
-    "SP500": "^GSPC",   # S&P 500 — thị trường Mỹ dẫn dắt VN
-    "VIX":   "^VIX",    # CBOE VIX — chỉ số sợ hãi toàn cầu
-    "OIL":   "BZ=F",    # Dầu Brent — ảnh hưởng GAS, HPG
-    "GOLD":  "GC=F",    # Giá vàng — tài sản trú ẩn an toàn
-    "DXY":   "DX-Y.NYB",# US Dollar Index — áp lực tỷ giá toàn cầu
+    "SP500": "^GSPC",    # S&P 500 — thị trường Mỹ dẫn dắt VN
+    "VIX":   "^VIX",     # CBOE VIX — chỉ số sợ hãi toàn cầu
+    "OIL":   "BZ=F",     # Dầu Brent — ảnh hưởng GAS, HPG
+    "GOLD":  "GC=F",     # Giá vàng — tài sản trú ẩn an toàn
+    "DXY":   "DX-Y.NYB", # US Dollar Index — áp lực tỷ giá toàn cầu
 }
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _to_log_return(close: pd.Series, name: str) -> pd.Series:
+    """Tính log return hàng ngày, chuẩn hoá index về date."""
+    close.index = pd.to_datetime(close.index).normalize()
+    ret = np.log(close / close.shift(1)).dropna()
+    ret.name = name
+    return ret
+
 
 def _to_monthly_return(close: pd.Series, name: str) -> pd.Series:
     """Chuẩn hoá index về month-end và tính log return."""
@@ -61,56 +68,103 @@ def _to_monthly_return(close: pd.Series, name: str) -> pd.Series:
 # Tải dữ liệu VN (vnstock)
 # ------------------------------------------------------------------
 
-def _download_vn_symbol(symbol: str) -> pd.Series | None:
+def _download_vn_symbol(symbol: str, freq: str = "monthly") -> tuple[pd.Series | None, pd.Series | None]:
+    """
+    Trả về (log_return_series, close_price_series).
+    freq="daily"   → interval 1D
+    freq="monthly" → interval 1M
+    """
+    interval = "1D" if freq == "daily" else "1M"
     try:
         stock = Vnstock().stock(symbol=symbol, source="KBS")
-        df = stock.quote.history(start=START_DATE, end=END_DATE, interval="1M")
+        df = stock.quote.history(start=START_DATE, end=END_DATE, interval=interval)
         if df is None or df.empty:
             print(f"  [WARNING] Không có dữ liệu: {symbol}")
-            return None
+            return None, None
         df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
         df = df.set_index("time").sort_index()
         close = df["close"].astype(float)
-        return _to_monthly_return(close, symbol)
+        close.name = symbol
+        if freq == "daily":
+            return _to_log_return(close.copy(), symbol), close
+        else:
+            close_monthly = close.copy()
+            close_monthly.index = pd.to_datetime(close_monthly.index).to_period("M").to_timestamp("M")
+            return _to_monthly_return(close.copy(), symbol), close_monthly
     except Exception as e:
         print(f"  [WARNING] Lỗi khi tải {symbol}: {e}")
-        return None
+        return None, None
 
 
-def load_vn_data() -> pd.DataFrame:
-    """Tải VNINDEX + 9 blue-chip, lưu Data/vn_stocks.csv."""
-    print("\n[1/2] Tải dữ liệu VN (vnstock)...")
+def get_latest_prices(freq: str = "daily") -> pd.Series:
+    """
+    Trả về giá đóng cửa mới nhất của VNINDEX + các blue-chip.
+    Dùng để tính giá dự báo từ predicted return.
+    """
+    suffix = "_daily" if freq == "daily" else ""
+    price_path = DATA_DIR / f"prices{suffix}.csv"
+    if price_path.exists():
+        df = pd.read_csv(price_path, index_col=0, parse_dates=True)
+        return df.iloc[-1]
+
+    # Nếu chưa có file, tải lại
+    load_vn_data(freq)
+    if price_path.exists():
+        df = pd.read_csv(price_path, index_col=0, parse_dates=True)
+        return df.iloc[-1]
+    return pd.Series(dtype=float)
+
+
+def load_vn_data(freq: str = "monthly") -> pd.DataFrame:
+    """Tải VNINDEX + blue-chip VN. Lưu thêm prices[_daily].csv (giá đóng cửa thực)."""
+    label = "daily" if freq == "daily" else "monthly"
+    print(f"\n[1/2] Tải dữ liệu VN ({label}, vnstock)...")
 
     series_list = []
+    price_list  = []
 
-    # Target: VNINDEX
     print(f"  → VNINDEX (target)")
-    s = _download_vn_symbol(TARGET_SYMBOL)
+    s, p = _download_vn_symbol(TARGET_SYMBOL, freq)
     if s is None:
         raise RuntimeError("Không tải được VN-Index.")
     s.name = "VNINDEX_Return"
     series_list.append(s)
+    if p is not None:
+        p.name = "VNINDEX"
+        price_list.append(p)
 
-    # Features: blue-chip
     for symbol, name in VN_SYMBOLS.items():
         print(f"  → {symbol} ({name})")
-        s = _download_vn_symbol(symbol)
+        s, p = _download_vn_symbol(symbol, freq)
         if s is not None:
             series_list.append(s)
+        if p is not None:
+            price_list.append(p)
 
     df = pd.concat(series_list, axis=1)
-    df.index = df.index.to_period("M").to_timestamp("M")
+    df.index = pd.to_datetime(df.index)
     df = df.loc[START_DATE:END_DATE]
 
-    # Bỏ cột thiếu > 30% dữ liệu (xử lý cổ phiếu IPO muộn còn sót)
+    # Bỏ cột thiếu > 30% dữ liệu
     thresh = int(len(df) * 0.7)
     df = df.dropna(axis=1, thresh=thresh)
-    # Bỏ hàng đầu chuỗi chưa có đủ dữ liệu (yêu cầu >= 80% cột)
+    # Bỏ hàng chưa đủ 80% cột
     df = df.dropna(thresh=int(len(df.columns) * 0.8))
 
-    path = DATA_DIR / "vn_stocks.csv"
+    suffix = "_daily" if freq == "daily" else ""
+    path = DATA_DIR / f"vn_stocks{suffix}.csv"
     df.to_csv(path)
     print(f"  Đã lưu: {path}  {df.shape}")
+
+    # Lưu giá đóng cửa thực (để tính giá dự báo từ predicted return)
+    if price_list:
+        df_prices = pd.concat(price_list, axis=1)
+        df_prices.index = pd.to_datetime(df_prices.index)
+        df_prices = df_prices.loc[START_DATE:END_DATE].ffill(limit=3)
+        price_path = DATA_DIR / f"prices{suffix}.csv"
+        df_prices.to_csv(price_path)
+        print(f"  Đã lưu giá: {price_path}  {df_prices.shape}")
+
     return df
 
 
@@ -118,9 +172,12 @@ def load_vn_data() -> pd.DataFrame:
 # Tải dữ liệu Macro (yfinance)
 # ------------------------------------------------------------------
 
-def load_macro_data() -> pd.DataFrame:
-    """Tải S&P500, VIX, Giá dầu, Tỷ giá USD/VND, DXY, lưu Data/macro.csv."""
-    print("\n[2/2] Tải dữ liệu Macro (yfinance)...")
+def load_macro_data(freq: str = "monthly") -> pd.DataFrame:
+    """Tải S&P500, VIX, Giá dầu, Gold, DXY."""
+    label = "daily" if freq == "daily" else "monthly"
+    print(f"\n[2/2] Tải dữ liệu Macro ({label}, yfinance)...")
+
+    yf_interval = "1d" if freq == "daily" else "1mo"
 
     series_list = []
     for col_name, ticker in MACRO_SYMBOLS.items():
@@ -130,7 +187,7 @@ def load_macro_data() -> pd.DataFrame:
                 ticker,
                 start=START_DATE,
                 end=END_DATE,
-                interval="1mo",
+                interval=yf_interval,
                 auto_adjust=True,
                 progress=False,
             )
@@ -139,7 +196,10 @@ def load_macro_data() -> pd.DataFrame:
                 continue
 
             close = raw["Close"].squeeze().dropna()
-            s = _to_monthly_return(close, col_name)
+            if freq == "daily":
+                s = _to_log_return(close, col_name)
+            else:
+                s = _to_monthly_return(close, col_name)
             series_list.append(s)
         except Exception as e:
             print(f"    [WARNING] Lỗi khi tải {ticker}: {e}")
@@ -149,14 +209,17 @@ def load_macro_data() -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.concat(series_list, axis=1)
-    df.index = df.index.to_period("M").to_timestamp("M")
+    df.index = pd.to_datetime(df.index)
     df = df.loc[START_DATE:END_DATE]
 
-    # Forward-fill tối đa 1 tháng để lấp gaps nhỏ (macro thay đổi chậm)
-    # Sau đó bỏ hàng vẫn còn NaN (đầu chuỗi chưa có data)
-    df = df.ffill(limit=1).dropna()
+    if freq == "daily":
+        # Forward-fill tối đa 3 ngày (ngày nghỉ lễ VN/US không trùng nhau)
+        df = df.ffill(limit=3).dropna()
+    else:
+        df = df.ffill(limit=1).dropna()
 
-    path = DATA_DIR / "macro.csv"
+    suffix = "_daily" if freq == "daily" else ""
+    path = DATA_DIR / f"macro{suffix}.csv"
     df.to_csv(path)
     print(f"  Đã lưu: {path}  {df.shape}")
     return df
@@ -166,14 +229,18 @@ def load_macro_data() -> pd.DataFrame:
 # Ghép dataset tổng hợp
 # ------------------------------------------------------------------
 
-def load_dataset(use_cache: bool = True) -> pd.DataFrame:
+def load_dataset(use_cache: bool = True, freq: str = "monthly") -> pd.DataFrame:
     """
     Ghép VN stocks + macro thành dataset cuối cùng.
 
-    use_cache=True : đọc từ Data/dataset.csv nếu đã tồn tại (nhanh hơn).
-    use_cache=False: tải lại từ đầu và ghi đè file cache.
+    freq="monthly" → Data/dataset.csv
+    freq="daily"   → Data/dataset_daily.csv
+
+    use_cache=True : đọc từ CSV nếu đã tồn tại.
+    use_cache=False: tải lại từ đầu và ghi đè.
     """
-    cache_path = DATA_DIR / "dataset.csv"
+    suffix = "_daily" if freq == "daily" else ""
+    cache_path = DATA_DIR / f"dataset{suffix}.csv"
 
     if use_cache and cache_path.exists():
         print(f"Đọc từ cache: {cache_path}")
@@ -184,17 +251,23 @@ def load_dataset(use_cache: bool = True) -> pd.DataFrame:
         return df
 
     # Tải mới
-    df_vn    = load_vn_data()
-    df_macro = load_macro_data()
+    df_vn    = load_vn_data(freq)
+    df_macro = load_macro_data(freq)
 
-    # Ghép: giữ tất cả tháng VN làm gốc, macro ffill lấp chỗ trống
     if df_macro.empty:
         df = df_vn.copy()
     else:
-        df = df_vn.join(df_macro, how="left")
-        # Macro thay đổi chậm — ffill tối đa 2 tháng cho các gaps nhỏ
-        macro_cols = df_macro.columns.tolist()
-        df[macro_cols] = df[macro_cols].ffill(limit=2)
+        # Inner join: chỉ giữ ngày có cả VN lẫn macro
+        # (VN và US có ngày nghỉ lễ khác nhau → dùng inner + ffill nhỏ)
+        df = df_vn.join(df_macro, how="inner")
+
+        if freq == "daily":
+            # Với daily: sau inner join vẫn có thể thiếu 1-2 ngày do holidays
+            macro_cols = df_macro.columns.tolist()
+            df[macro_cols] = df[macro_cols].ffill(limit=2)
+        else:
+            macro_cols = df_macro.columns.tolist()
+            df[macro_cols] = df[macro_cols].ffill(limit=2)
 
     # Loại cột thiếu > 30% dữ liệu
     thresh = int(len(df) * 0.7)
@@ -207,10 +280,9 @@ def load_dataset(use_cache: bool = True) -> pd.DataFrame:
     cols = [c for c in df.columns if c != "VNINDEX_Return"] + ["VNINDEX_Return"]
     df = df[cols]
 
-    # Lưu cache
     df.to_csv(cache_path)
 
-    print(f"\nDataset tổng hợp:")
+    print(f"\nDataset tổng hợp ({freq}):")
     print(f"  Shape   : {df.shape}")
     print(f"  Thời gian: {df.index[0].date()} → {df.index[-1].date()}")
     print(f"  Columns : {list(df.columns)}")
@@ -223,8 +295,10 @@ def load_dataset(use_cache: bool = True) -> pd.DataFrame:
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=== Test Data Loader ===\n")
-    df = load_dataset(use_cache=False)
+    import sys
+    freq = sys.argv[1] if len(sys.argv) > 1 else "monthly"
+    print(f"=== Test Data Loader ({freq}) ===\n")
+    df = load_dataset(use_cache=False, freq=freq)
     print("\nMẫu 5 dòng đầu:")
     print(df.head())
     print("\nThống kê mô tả:")
