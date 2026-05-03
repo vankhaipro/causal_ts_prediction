@@ -1,5 +1,11 @@
 .venv/
 venv/
 __pycache__/
-*.pyc.venv/
-venv/
+*.pyc
+
+# Data and large files
+Data/*.csv
+*.png
+*.jpg
+*.jpeg
+*.gif

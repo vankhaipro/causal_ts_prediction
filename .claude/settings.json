@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python cafef_crawler.py --demo)",
+      "Bash(python vneconomy_crawler.py --demo)",
+      "Bash(python3 -c \"import pandas as pd; df=pd.read_csv\\('Data/vneconomy_raw.csv'\\); print\\(df.columns.tolist\\(\\)\\); print\\(df[['title','description']].head\\(2\\).to_string\\(\\)\\)\")"
+    ]
+  }
+}

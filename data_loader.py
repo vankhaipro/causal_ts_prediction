@@ -229,15 +229,36 @@ def load_macro_data(freq: str = "monthly") -> pd.DataFrame:
 # Ghép dataset tổng hợp
 # ------------------------------------------------------------------
 
-def load_dataset(use_cache: bool = True, freq: str = "monthly") -> pd.DataFrame:
+def load_news_features(freq: str = "daily") -> pd.DataFrame:
     """
-    Ghép VN stocks + macro thành dataset cuối cùng.
+    Đọc Data/news_features_daily.csv (output của news_processor.py).
+    Nếu freq="monthly" thì resample về tháng.
+    Trả về DataFrame rỗng nếu file chưa tồn tại (news optional).
+    """
+    news_path = DATA_DIR / "news_features_daily.csv"
+    if not news_path.exists():
+        print("  [INFO] Chưa có news_features_daily.csv — bỏ qua news features.")
+        return pd.DataFrame()
+
+    df = pd.read_csv(news_path, index_col=0, parse_dates=True)
+    df.index = pd.to_datetime(df.index).normalize()
+
+    if freq == "monthly":
+        # Resample về tháng (mean), align index về month-end
+        df = df.resample("ME").mean()
+
+    print(f"  [News] {df.shape}  {df.index[0].date()} → {df.index[-1].date()}")
+    return df
+
+
+def load_dataset(use_cache: bool = True, freq: str = "monthly",
+                 with_news: bool = True) -> pd.DataFrame:
+    """
+    Ghép VN stocks + macro (+ news features tuỳ chọn) thành dataset cuối cùng.
 
     freq="monthly" → Data/dataset.csv
     freq="daily"   → Data/dataset_daily.csv
-
-    use_cache=True : đọc từ CSV nếu đã tồn tại.
-    use_cache=False: tải lại từ đầu và ghi đè.
+    with_news      → tích hợp news_features nếu file tồn tại
     """
     suffix = "_daily" if freq == "daily" else ""
     cache_path = DATA_DIR / f"dataset{suffix}.csv"
@@ -257,17 +278,21 @@ def load_dataset(use_cache: bool = True, freq: str = "monthly") -> pd.DataFrame:
     if df_macro.empty:
         df = df_vn.copy()
     else:
-        # Inner join: chỉ giữ ngày có cả VN lẫn macro
-        # (VN và US có ngày nghỉ lễ khác nhau → dùng inner + ffill nhỏ)
         df = df_vn.join(df_macro, how="inner")
+        macro_cols = df_macro.columns.tolist()
+        df[macro_cols] = df[macro_cols].ffill(limit=2)
 
-        if freq == "daily":
-            # Với daily: sau inner join vẫn có thể thiếu 1-2 ngày do holidays
-            macro_cols = df_macro.columns.tolist()
-            df[macro_cols] = df[macro_cols].ffill(limit=2)
-        else:
-            macro_cols = df_macro.columns.tolist()
-            df[macro_cols] = df[macro_cols].ffill(limit=2)
+    # Tích hợp news features (optional)
+    if with_news:
+        df_news = load_news_features(freq)
+        if not df_news.empty:
+            # Left join: giữ tất cả ngày giao dịch, news forward-fill tối đa 5 ngày
+            df = df.join(df_news, how="left")
+            news_cols = df_news.columns.tolist()
+            df[news_cols] = df[news_cols].ffill(limit=5)
+            n_filled = df[news_cols[0]].notna().sum()
+            print(f"  [News] Tích hợp {len(news_cols)} news features "
+                  f"({n_filled}/{len(df)} hàng có dữ liệu)")
 
     # Loại cột thiếu > 30% dữ liệu
     thresh = int(len(df) * 0.7)
@@ -276,14 +301,13 @@ def load_dataset(use_cache: bool = True, freq: str = "monthly") -> pd.DataFrame:
     # Loại hàng còn NaN
     df = df.dropna()
 
-    # Thêm volatility features từ VNINDEX_Return
-    # Vol5/Vol20 = rolling std 5/20 kỳ — capture chế độ biến động thị trường
+    # Volatility features
     if "VNINDEX_Return" in df.columns:
         df["VNINDEX_Vol5"]  = df["VNINDEX_Return"].rolling(5).std()
         df["VNINDEX_Vol20"] = df["VNINDEX_Return"].rolling(20).std()
         df = df.dropna()
 
-    # Đảm bảo VNINDEX_Return là cột cuối (target)
+    # VNINDEX_Return luôn là cột cuối (target)
     cols = [c for c in df.columns if c != "VNINDEX_Return"] + ["VNINDEX_Return"]
     df = df[cols]
 

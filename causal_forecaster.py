@@ -185,6 +185,181 @@ class CausalForecaster:
         return fig
 
     # ------------------------------------------------------------------
+    # Phase 5 — Interpretation & Visualization
+    # ------------------------------------------------------------------
+
+    def plot_effect_heatmap(self, freq: str = "monthly") -> None:
+        """
+        Heatmap MCI coefficient: (biến nguồn × biến đích).
+        Ô có màu = tồn tại liên kết nhân quả có ý nghĩa.
+        """
+        if self.pcmci_results is None:
+            print("Chưa chạy causal discovery.")
+            return
+
+        graph   = self.pcmci_results["graph"]
+        val_mat = self.pcmci_results["val_matrix"]   # shape (N, N, tau+1)
+        names   = self.feature_names
+        N       = len(names)
+
+        # Lấy giá trị mạnh nhất trên tất cả độ trễ cho mỗi cặp (i→j)
+        effect = np.zeros((N, N))
+        for i in range(N):
+            for j in range(N):
+                for tau in range(graph.shape[2]):
+                    if graph[i, j, tau] == "-->":
+                        if abs(val_mat[i, j, tau]) > abs(effect[i, j]):
+                            effect[i, j] = val_mat[i, j, tau]
+
+        unit = "ngày" if freq == "daily" else "tháng"
+        fig, ax = plt.subplots(figsize=(max(10, N * 0.7), max(8, N * 0.6)))
+        im = ax.imshow(effect.T, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+        ax.set_xticks(range(N)); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
+        ax.set_yticks(range(N)); ax.set_yticklabels(names, fontsize=8)
+        ax.set_xlabel("Biến nguồn (nguyên nhân)", fontsize=10)
+        ax.set_ylabel("Biến đích (kết quả)", fontsize=10)
+        ax.set_title(f"Causal Effect Heatmap — MCI Coefficient ({unit})", fontsize=13)
+        plt.colorbar(im, ax=ax, label="MCI coefficient")
+
+        # Đánh dấu ô liên quan đến target
+        tgt = names.index(self.target_col)
+        ax.axhline(tgt - 0.5, color="gold", linewidth=2)
+        ax.axhline(tgt + 0.5, color="gold", linewidth=2)
+
+        plt.tight_layout()
+        suffix = "_daily" if freq == "daily" else ""
+        fname = f"causal_heatmap{suffix}.png"
+        plt.savefig(fname, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Đã lưu: {fname}")
+
+    def plot_lag_effects(self, freq: str = "monthly") -> None:
+        """
+        Bar chart hệ số MCI theo từng độ trễ τ cho các liên kết
+        X → VNINDEX_Return được tìm thấy bởi PCMCI+.
+        """
+        if self.pcmci_results is None:
+            return
+
+        graph   = self.pcmci_results["graph"]
+        val_mat = self.pcmci_results["val_matrix"]
+        pval    = self.pcmci_results["p_matrix"]
+        names   = self.feature_names
+        tgt     = names.index(self.target_col)
+        tau_max = graph.shape[2] - 1
+        unit    = "ngày" if freq == "daily" else "tháng"
+
+        # Thu thập tất cả nguồn có liên kết → target
+        sources = []
+        for i, name in enumerate(names):
+            if name == self.target_col:
+                continue
+            for tau in range(graph.shape[2]):
+                if graph[i, tgt, tau] == "-->":
+                    sources.append(name)
+                    break
+
+        if not sources:
+            print("Không có causal links → target.")
+            return
+
+        fig, axes = plt.subplots(
+            len(sources), 1,
+            figsize=(8, 3 * len(sources)),
+            squeeze=False,
+        )
+
+        for row, src in enumerate(sources):
+            ax  = axes[row][0]
+            idx = names.index(src)
+            taus  = list(range(1, tau_max + 1))
+            coefs = [val_mat[idx, tgt, t] for t in taus]
+            pvals = [pval[idx, tgt, t]    for t in taus]
+            colors = ["#C44E52" if p < 0.05 else "#AAAAAA" for p in pvals]
+
+            bars = ax.bar(taus, coefs, color=colors, edgecolor="white")
+            ax.axhline(0, color="black", linewidth=0.8)
+            ax.set_xticks(taus)
+            ax.set_xticklabels([f"τ={t}" for t in taus])
+            ax.set_ylabel("MCI coef", fontsize=9)
+            ax.set_title(
+                f"{src} → {self.target_col}   "
+                f"(đỏ = p<0.05)",
+                fontsize=10,
+            )
+            ax.grid(axis="y", linestyle=":", alpha=0.5)
+
+        fig.suptitle(
+            f"Hệ số nhân quả theo độ trễ τ ({unit}) — PCMCI+",
+            fontsize=13, y=1.01,
+        )
+        plt.tight_layout()
+        suffix = "_daily" if freq == "daily" else ""
+        fname = f"causal_lag_effects{suffix}.png"
+        plt.savefig(fname, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Đã lưu: {fname}")
+
+    def news_impact_report(self) -> 'pd.DataFrame':
+        """
+        Bảng tóm tắt kết quả nhân quả dạng readable (Phase 5).
+        Trả về DataFrame và in ra terminal.
+
+        Columns: Nguyên nhân | Biến đích | Độ trễ | Hệ số MCI | p-value | Chiều tác động
+        """
+        import pandas as pd
+
+        if self.pcmci_results is None:
+            return pd.DataFrame()
+
+        graph   = self.pcmci_results["graph"]
+        val_mat = self.pcmci_results["val_matrix"]
+        pval    = self.pcmci_results["p_matrix"]
+        names   = self.feature_names
+
+        rows = []
+        for i, src in enumerate(names):
+            for j, dst in enumerate(names):
+                for tau in range(graph.shape[2]):
+                    if graph[i, j, tau] == "-->":
+                        coef = val_mat[i, j, tau]
+                        p    = pval[i, j, tau]
+                        direction = "↑ tăng" if coef > 0 else "↓ giảm"
+                        rows.append({
+                            "Nguyên nhân":      src,
+                            "Biến đích":        dst,
+                            "Độ trễ (τ)":       tau,
+                            "Hệ số MCI":        round(coef, 4),
+                            "p-value":          round(p, 4),
+                            "Chiều tác động":   direction,
+                            "→ Target":         dst == self.target_col,
+                        })
+
+        if not rows:
+            print("Không tìm thấy liên kết nhân quả nào.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).sort_values(
+            ["→ Target", "p-value"], ascending=[False, True]
+        ).reset_index(drop=True)
+
+        print("\n" + "=" * 70)
+        print(f"  NEWS IMPACT REPORT — Kết quả PCMCI+")
+        print("=" * 70)
+
+        target_links = df[df["→ Target"]]
+        if target_links.empty:
+            print(f"  Không có biến nào nhân quả trực tiếp với {self.target_col}.")
+        else:
+            print(f"\n  Liên kết trực tiếp → {self.target_col}:")
+            cols = ["Nguyên nhân", "Độ trễ (τ)", "Hệ số MCI", "p-value", "Chiều tác động"]
+            print(target_links[cols].to_string(index=False))
+
+        print(f"\n  Tổng cộng: {len(df)} liên kết nhân quả trong hệ thống.")
+        print("=" * 70)
+        return df
+
+    # ------------------------------------------------------------------
     # Forecasting — Ridge (Rolling Window)
     # ------------------------------------------------------------------
 

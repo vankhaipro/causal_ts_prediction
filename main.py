@@ -31,13 +31,13 @@ FREQ_CONFIG = {
 }
 
 
-def main(freq: str = "monthly"):
+def main(freq: str = "monthly", use_cache: bool = True):
     cfg = FREQ_CONFIG[freq]
     print(f"=== Causal TS Prediction — VN-Index ({freq}) ===\n")
 
     # 1. Load data
     print("--- 1. Load Data ---")
-    df = load_dataset(freq=freq)
+    df = load_dataset(freq=freq, use_cache=use_cache)
     print(f"  Shape: {df.shape}")
 
     forecaster = CausalForecaster(target_col="VNINDEX_Return")
@@ -60,11 +60,14 @@ def main(freq: str = "monthly"):
         pc_alpha=cfg["pc_alpha"],
     )
 
-    # 4. Trích xuất causal features + visualize graph
-    print("\n--- 4. Causal Features & Graph ---")
+    # 4. Trích xuất causal features + visualize
+    print("\n--- 4. Causal Features & Graph (Phase 5) ---")
     causal_pairs = forecaster.extract_features()
     print(f"  Số features nhân quả: {len(forecaster.selected_features)}")
     forecaster.visualize_graph(freq=freq)
+    forecaster.plot_effect_heatmap(freq=freq)
+    forecaster.plot_lag_effects(freq=freq)
+    impact_df = forecaster.news_impact_report()
 
     # 5. So sánh 3 baselines với rolling window
     window = min(cfg["window_size"], len(df) // 3)
@@ -86,8 +89,6 @@ def main(freq: str = "monthly"):
 
 
 if __name__ == "__main__":
-    freq_arg = sys.argv[1] if len(sys.argv) > 1 else "monthly"
-    if freq_arg not in FREQ_CONFIG:
-        print(f"Tần suất không hợp lệ: '{freq_arg}'. Dùng 'daily' hoặc 'monthly'.")
-        sys.exit(1)
-    main(freq_arg)
+    freq_arg  = next((a for a in sys.argv[1:] if a in FREQ_CONFIG), "monthly")
+    use_cache = "--fresh" not in sys.argv
+    main(freq_arg, use_cache=use_cache)
