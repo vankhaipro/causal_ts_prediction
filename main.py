@@ -18,7 +18,7 @@ from data_loader import load_dataset
 FREQ_CONFIG = {
     "monthly": {
         "tau_max":     3,    # lag tối đa: 3 tháng
-        "pc_alpha":    0.05,
+        "pc_alpha":    0.1,  # nới lỏng hơn vì monthly chỉ ~132 điểm
         "window_size": 60,   # rolling window: 60 tháng (~5 năm)
         "unit":        "tháng",
     },
@@ -51,11 +51,20 @@ def main(freq: str = "monthly", use_cache: bool = True):
     else:
         print("  Tất cả columns đã stationary. ✓")
 
+    # 2b. Fix non-stationary + NaN trước khi đưa vào PCMCI+
+    df_clean = df.copy()
+    if non_stat:
+        print(f"  → Diff các cột non-stationary: {non_stat}")
+        df_clean[non_stat] = df_clean[non_stat].diff()
+    before = len(df_clean)
+    df_clean = df_clean.dropna()
+    print(f"  → Sau khi dropna: {before} → {len(df_clean)} hàng")
+
     # 3. Causal discovery — PCMCI+
     #    tau_min=1 đảm bảo chỉ tìm X(t-τ) → Y(t), không look-ahead bias.
     print(f"\n--- 3. Causal Discovery (PCMCI+, tau_max={cfg['tau_max']}) ---")
     forecaster.perform_causal_discovery(
-        df,
+        df_clean,
         tau_max=cfg["tau_max"],
         pc_alpha=cfg["pc_alpha"],
     )
@@ -70,9 +79,9 @@ def main(freq: str = "monthly", use_cache: bool = True):
     impact_df = forecaster.news_impact_report()
 
     # 5. So sánh 3 baselines với rolling window
-    window = min(cfg["window_size"], len(df) // 3)
+    window = min(cfg["window_size"], len(df_clean) // 3)
     print(f"\n--- 5. Model Comparison (Rolling Window = {window} {cfg['unit']}) ---")
-    results = forecaster.compare_models(df, window_size=window, freq=freq)
+    results = forecaster.compare_models(df_clean, window_size=window, freq=freq)
 
     # 6. Tổng kết
     print("\n=== KẾT QUẢ TỔNG KẾT ===")

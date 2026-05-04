@@ -620,6 +620,38 @@ class CausalForecaster:
         return {'model': model_name, 'mse': mse, 'mae': mae, 'da': da,
                 'actuals': actuals, 'predictions': predictions}
 
+    def _rolling_forecast_clf(self, df, feature_cols, window_size=60):
+        """Rolling window Logistic Regression — dự báo trực tiếp chiều tăng/giảm."""
+        from sklearn.linear_model import LogisticRegression
+
+        df_lag = df[feature_cols].shift(1).copy()
+        df_lag[self.target_col] = df[self.target_col]
+        df_lag = df_lag.dropna()
+
+        y_cont = df_lag[self.target_col].values
+        y      = (y_cont > 0).astype(int)   # 1=tăng, 0=giảm
+        X      = df_lag[feature_cols].values
+
+        predictions, actuals = [], []
+        for i in range(window_size, len(df_lag)):
+            X_train, y_train = X[i - window_size:i], y[i - window_size:i]
+            X_test = X[i:i + 1]
+
+            if len(np.unique(y_train)) < 2:
+                predictions.append(0)
+                actuals.append(y_cont[i])
+                continue
+
+            scaler = StandardScaler()
+            clf = LogisticRegression(max_iter=500, C=1.0)
+            clf.fit(scaler.fit_transform(X_train), y_train)
+            pred_dir = clf.predict(scaler.transform(X_test))[0]
+            # Chuyển về sign để dùng chung evaluate()
+            predictions.append(1.0 if pred_dir == 1 else -1.0)
+            actuals.append(y_cont[i])
+
+        return np.array(actuals), np.array(predictions)
+
     def compare_models(self, df, window_size=60, freq: str = "monthly",
                        use_lstm: bool = False, lstm_epochs: int = 20):
         """
@@ -627,27 +659,35 @@ class CausalForecaster:
           1. All-features Ridge
           2. LASSO Ridge
           3. Causal Ridge (PCMCI+)
-          4. Causal LSTM (PCMCI+ features, nếu use_lstm=True)
+          4. Causal Logistic (PCMCI+ features) — tối ưu trực tiếp DA
+          5. Causal LSTM (PCMCI+ features, nếu use_lstm=True)
         """
         all_cols = [c for c in df.columns if c != self.target_col]
 
-        print("\n[1/3] All-features Ridge")
+        print("\n[1/4] All-features Ridge")
         act, pred_all = self._rolling_forecast(df, all_cols, window_size)
         r_all = self.evaluate(act, pred_all, 'All-features Ridge')
 
-        print("\n[2/3] LASSO Ridge")
+        print("\n[2/4] LASSO Ridge")
         df_lasso  = self.reduce_dimensions(df, method='lasso')
         lasso_cols = [c for c in df_lasso.columns if c != self.target_col]
         _, pred_lasso = self._rolling_forecast(df, lasso_cols, window_size)
         r_lasso = self.evaluate(act, pred_lasso, 'LASSO Ridge')
 
-        print("\n[3/3] Causal Ridge (PCMCI+)")
+        print("\n[3/4] Causal Ridge (PCMCI+)")
         r_causal = None
         if self.selected_features:
             _, pred_causal = self._rolling_forecast(df, self.selected_features, window_size)
             r_causal = self.evaluate(act, pred_causal, 'Causal Ridge (PCMCI+)')
         else:
             print("  Không tìm được causal features.")
+
+        print("\n[4/4] Causal Logistic (PCMCI+ — tối ưu DA trực tiếp)")
+        r_clf = None
+        clf_cols = self.selected_features if self.selected_features else lasso_cols
+        if clf_cols:
+            _, pred_clf = self._rolling_forecast_clf(df, clf_cols, window_size)
+            r_clf = self.evaluate(act, pred_clf, 'Causal Logistic')
 
         r_lstm = None
         if use_lstm and TORCH_AVAILABLE and self.selected_features:
@@ -662,7 +702,7 @@ class CausalForecaster:
             if act_lstm is not None:
                 r_lstm = self.evaluate(act_lstm, pred_lstm, 'Causal LSTM (PCMCI+)')
 
-        results = {'all': r_all, 'lasso': r_lasso, 'causal': r_causal, 'lstm': r_lstm}
+        results = {'all': r_all, 'lasso': r_lasso, 'causal': r_causal, 'clf': r_clf, 'lstm': r_lstm}
         self._plot_comparison(results, act, freq=freq)
         return results
 

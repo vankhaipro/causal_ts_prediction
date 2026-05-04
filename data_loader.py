@@ -266,9 +266,22 @@ def load_dataset(use_cache: bool = True, freq: str = "monthly",
     if use_cache and cache_path.exists():
         print(f"Đọc từ cache: {cache_path}")
         df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        # Bỏ news columns cũ (nếu có) để merge lại với data mới nhất
+        news_cols_old = [c for c in df.columns if c.startswith("sentiment") or c.startswith("topic") or c == "article_count"]
+        if news_cols_old:
+            df = df.drop(columns=news_cols_old)
         print(f"  Shape: {df.shape}")
         print(f"  Thời gian: {df.index[0].date()} → {df.index[-1].date()}")
         print(f"  Columns: {list(df.columns)}")
+        if with_news:
+            df_news = load_news_features(freq)
+            if not df_news.empty:
+                df = df.join(df_news, how="left")
+                news_cols = df_news.columns.tolist()
+                df[news_cols] = df[news_cols].ffill(limit=5)
+                n_filled = df[news_cols[0]].notna().sum()
+                print(f"  [News] Tích hợp {len(news_cols)} news features "
+                      f"({n_filled}/{len(df)} hàng có dữ liệu)")
         return df
 
     # Tải mới
