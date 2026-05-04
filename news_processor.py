@@ -1,8 +1,8 @@
 """
 news_processor.py — Phase 2: NLP Pipeline
-Sentiment Analysis + LDA Topic Modeling trên VnExpress articles
+Sentiment Analysis + LDA Topic Modeling trên VnEconomy articles
 
-Input : Data/vnexpress_raw.csv      (từ news_crawler.py)
+Input : Data/vneconomy_raw.csv      (từ vneconomy_crawler.py)
 Output: Data/news_features_daily.csv
 
 Cách chạy:
@@ -26,9 +26,9 @@ from tqdm import tqdm
 # Config
 # ------------------------------------------------------------------
 DATA_DIR        = Path(__file__).parent / "Data"
-RAW_FILE        = DATA_DIR / "vnexpress_raw.csv"
-SENT_CACHE      = DATA_DIR / ".sentiment_cache.csv"
-LDA_MODEL_DIR   = DATA_DIR / "lda_model"
+RAW_FILE        = DATA_DIR / "vneconomy_raw.csv"
+SENT_CACHE      = DATA_DIR / ".vneconomy_sentiment_cache.csv"
+LDA_MODEL_DIR   = DATA_DIR / "lda_model_vneconomy"
 OUTPUT_FILE     = DATA_DIR / "news_features_daily.csv"
 
 SENTIMENT_MODEL = "wonrax/phobert-base-vietnamese-sentiment"
@@ -86,10 +86,12 @@ def tokenize_vi(text: str) -> list[str]:
 
 
 def build_text(row: pd.Series) -> str:
-    """Ghép title + description làm input cho NLP."""
-    title = str(row.get("title", "") or "")
-    desc  = str(row.get("description", "") or "")
-    return (title + ". " + desc).strip()
+    """Ghép title + description + 500 ký tự đầu của content cho sentiment.
+    Giới hạn content vì PhoBERT chỉ xử lý 256 tokens (~800-1000 ký tự)."""
+    title   = str(row.get("title", "") or "")
+    desc    = str(row.get("description", "") or "")
+    content = str(row.get("content", "") or "")[:500]
+    return (title + ". " + desc + " " + content).strip()
 
 
 # ------------------------------------------------------------------
@@ -224,7 +226,11 @@ def run_lda(df: pd.DataFrame, n_topics: int = N_TOPICS,
 
     # ---- Tokenize ----
     log.info("Tokenizing for LDA...")
-    raw_texts  = (df["title"].fillna("") + " " + df["description"].fillna("")).tolist()
+    raw_texts  = (
+        df["title"].fillna("") + " " +
+        df["description"].fillna("") + " " +
+        df["content"].fillna("")
+    ).tolist()
     cleaned    = [clean_text(t) for t in raw_texts]
     tokenized  = [tokenize_vi(t) for t in tqdm(cleaned, desc="Tokenize")]
 
@@ -345,7 +351,7 @@ def process(use_gpu: bool = False,
     if not RAW_FILE.exists():
         raise FileNotFoundError(
             f"Không tìm thấy {RAW_FILE}.\n"
-            "Hãy chạy `python news_crawler.py` trước."
+            "Hãy chạy `python vneconomy_crawler.py` trước."
         )
 
     # ---- Load raw articles ----
