@@ -111,30 +111,40 @@ def _normalize_label(label: str) -> str:
     return _LABEL_MAP.get(label.lower(), "NEU")
 
 
-def _batch_sentiment(texts: list[str], clf) -> tuple[list[float], list[str]]:
-    """Chạy sentiment pipeline trên một batch, trả (scores, labels)."""
+def _batch_sentiment(texts: list[str], clf) -> tuple[list[float], list[str], list[float], list[float], list[float]]:
+    """Chạy sentiment pipeline trên một batch.
+
+    Returns (scores, labels, neg_probs, neu_probs, pos_probs).
+    Trả xác suất riêng từng chiều theo Paper 3 (Nguyen et al. 2023):
+    sentiment tác động lên volatility qua neg_prob, không chỉ qua scalar.
+    """
     scores, labels = [], []
+    neg_probs, neu_probs, pos_probs = [], [], []
     try:
         results = clf(texts)
         for res in results:
-            # top_k=None → list of dicts; top_k=1 → list of dict
             if isinstance(res, list):
                 score_map = {_normalize_label(r["label"]): r["score"] for r in res}
             else:
-                # top_k=1 mode
                 score_map = {_normalize_label(res["label"]): res["score"]}
-                for lbl in ["NEG", "NEU", "POS"]:
-                    score_map.setdefault(lbl, 0.0)
+            for lbl in ["NEG", "NEU", "POS"]:
+                score_map.setdefault(lbl, 0.0)
 
             weighted = sum(score_map.get(lbl, 0) * v for lbl, v in _SCORE_MAP.items())
             best = max(score_map, key=score_map.get)
             scores.append(round(weighted, 4))
             labels.append(best)
+            neg_probs.append(round(score_map["NEG"], 4))
+            neu_probs.append(round(score_map["NEU"], 4))
+            pos_probs.append(round(score_map["POS"], 4))
     except Exception as e:
         log.warning(f"  Batch lỗi: {e}")
         scores.extend([0.0] * len(texts))
         labels.extend(["NEU"] * len(texts))
-    return scores, labels
+        neg_probs.extend([0.0] * len(texts))
+        neu_probs.extend([1.0] * len(texts))
+        pos_probs.extend([0.0] * len(texts))
+    return scores, labels, neg_probs, neu_probs, pos_probs
 
 
 def run_sentiment(df: pd.DataFrame, device: int = -1) -> pd.DataFrame:
@@ -151,6 +161,12 @@ def run_sentiment(df: pd.DataFrame, device: int = -1) -> pd.DataFrame:
 
     if SENT_CACHE.exists():
         df_cache = pd.read_csv(SENT_CACHE)
+        # Backward compat: cache cũ chưa có neg/neu/pos_prob → derive từ label
+        if "neg_prob" not in df_cache.columns:
+            log.info("  Cache cũ — tự động derive neg/neu/pos_prob từ sentiment_label")
+            df_cache["neg_prob"] = (df_cache["sentiment_label"] == "NEG").astype(float)
+            df_cache["neu_prob"] = (df_cache["sentiment_label"] == "NEU").astype(float)
+            df_cache["pos_prob"] = (df_cache["sentiment_label"] == "POS").astype(float)
         cached_urls = set(df_cache["url"].dropna())
         cache_rows = df_cache.to_dict("records")
         log.info(f"  Cache: {len(cached_urls):,} bài đã xử lý")
@@ -158,10 +174,15 @@ def run_sentiment(df: pd.DataFrame, device: int = -1) -> pd.DataFrame:
     todo = df[~df["url"].isin(cached_urls)].copy()
     log.info(f"  Cần xử lý: {len(todo):,} bài")
 
+    SENT_COLS = ["url", "sentiment_score", "sentiment_label", "neg_prob", "neu_prob", "pos_prob"]
+
     if len(todo) == 0:
         df_cache = pd.read_csv(SENT_CACHE)
-        return df.merge(df_cache[["url", "sentiment_score", "sentiment_label"]],
-                        on="url", how="left")
+        if "neg_prob" not in df_cache.columns:
+            df_cache["neg_prob"] = (df_cache["sentiment_label"] == "NEG").astype(float)
+            df_cache["neu_prob"] = (df_cache["sentiment_label"] == "NEU").astype(float)
+            df_cache["pos_prob"] = (df_cache["sentiment_label"] == "POS").astype(float)
+        return df.merge(df_cache[SENT_COLS], on="url", how="left")
 
     # ---- Load model ----
     log.info(f"Loading model: {SENTIMENT_MODEL}  (device={'GPU' if device >= 0 else 'CPU'})")
@@ -179,27 +200,40 @@ def run_sentiment(df: pd.DataFrame, device: int = -1) -> pd.DataFrame:
     urls  = todo["url"].tolist()
 
     all_scores, all_labels = [], []
+    all_neg, all_neu, all_pos = [], [], []
+
     for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="Sentiment"):
         batch_texts = texts[i: i + BATCH_SIZE]
-        s, l = _batch_sentiment(batch_texts, clf)
+        s, l, neg, neu, pos = _batch_sentiment(batch_texts, clf)
         all_scores.extend(s)
         all_labels.extend(l)
+        all_neg.extend(neg)
+        all_neu.extend(neu)
+        all_pos.extend(pos)
 
         # Lưu checkpoint mỗi 100 batch
         if (i // BATCH_SIZE) % 100 == 0 and i > 0:
-            new_rows = [{"url": u, "sentiment_score": sc, "sentiment_label": lb}
-                        for u, sc, lb in zip(urls[:len(all_scores)], all_scores, all_labels)]
+            new_rows = [
+                {"url": u, "sentiment_score": sc, "sentiment_label": lb,
+                 "neg_prob": ng, "neu_prob": nu, "pos_prob": ps}
+                for u, sc, lb, ng, nu, ps in zip(
+                    urls[:len(all_scores)], all_scores, all_labels,
+                    all_neg, all_neu, all_pos)
+            ]
             _save_cache(cache_rows + new_rows)
 
     # ---- Merge + save cache ----
-    new_rows = [{"url": u, "sentiment_score": sc, "sentiment_label": lb}
-                for u, sc, lb in zip(urls, all_scores, all_labels)]
+    new_rows = [
+        {"url": u, "sentiment_score": sc, "sentiment_label": lb,
+         "neg_prob": ng, "neu_prob": nu, "pos_prob": ps}
+        for u, sc, lb, ng, nu, ps in zip(
+            urls, all_scores, all_labels, all_neg, all_neu, all_pos)
+    ]
     all_cache = cache_rows + new_rows
     _save_cache(all_cache)
 
     df_sent = pd.DataFrame(all_cache).drop_duplicates("url")
-    return df.merge(df_sent[["url", "sentiment_score", "sentiment_label"]],
-                    on="url", how="left")
+    return df.merge(df_sent[SENT_COLS], on="url", how="left")
 
 
 def _save_cache(rows: list[dict]) -> None:
@@ -316,6 +350,12 @@ def aggregate_daily(df: pd.DataFrame, n_topics: int) -> pd.DataFrame:
     sent_agg["sentiment_neg_pct"] = (
         df.groupby("date")["sentiment_label"].apply(lambda x: (x == "NEG").mean())
     )
+
+    # Paper 3 (Nguyen et al. 2023): xác suất riêng từng chiều làm feature độc lập
+    # neg_prob_mean tác động lên volatility mạnh hơn scalar sentiment_mean
+    for prob_col in ["neg_prob", "neu_prob", "pos_prob"]:
+        if prob_col in df.columns:
+            sent_agg[f"{prob_col}_mean"] = df.groupby("date")[prob_col].mean()
 
     # Topic aggregation
     topic_agg = df.groupby("date")[topic_cols].mean() if topic_cols else pd.DataFrame()

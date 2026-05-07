@@ -621,8 +621,13 @@ class CausalForecaster:
                 'actuals': actuals, 'predictions': predictions}
 
     def _rolling_forecast_clf(self, df, feature_cols, window_size=60):
-        """Rolling window Logistic Regression — dự báo trực tiếp chiều tăng/giảm."""
-        from sklearn.linear_model import LogisticRegression
+        """Rolling window Logistic Regression — dự báo trực tiếp chiều tăng/giảm.
+
+        Paper 4 (Yang et al. 2022): dùng LogisticRegressionCV + TimeSeriesSplit
+        để tune C đúng cách trên time series, tránh data leakage.
+        """
+        from sklearn.linear_model import LogisticRegressionCV
+        from sklearn.model_selection import TimeSeriesSplit
 
         df_lag = df[feature_cols].shift(1).copy()
         df_lag[self.target_col] = df[self.target_col]
@@ -633,6 +638,8 @@ class CausalForecaster:
         X      = df_lag[feature_cols].values
 
         predictions, actuals = [], []
+        tscv = TimeSeriesSplit(n_splits=3)
+
         for i in range(window_size, len(df_lag)):
             X_train, y_train = X[i - window_size:i], y[i - window_size:i]
             X_test = X[i:i + 1]
@@ -643,10 +650,20 @@ class CausalForecaster:
                 continue
 
             scaler = StandardScaler()
-            clf = LogisticRegression(max_iter=500, C=1.0)
-            clf.fit(scaler.fit_transform(X_train), y_train)
-            pred_dir = clf.predict(scaler.transform(X_test))[0]
-            # Chuyển về sign để dùng chung evaluate()
+            X_train_s = scaler.fit_transform(X_train)
+            X_test_s  = scaler.transform(X_test)
+
+            clf = LogisticRegressionCV(
+                Cs=np.logspace(-3, 2, 10),
+                cv=tscv,
+                scoring="accuracy",
+                penalty="l2",
+                solver="lbfgs",
+                max_iter=500,
+                random_state=42,
+            )
+            clf.fit(X_train_s, y_train)
+            pred_dir = clf.predict(X_test_s)[0]
             predictions.append(1.0 if pred_dir == 1 else -1.0)
             actuals.append(y_cont[i])
 
