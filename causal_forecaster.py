@@ -765,6 +765,133 @@ class CausalForecaster:
         return result
 
     # ------------------------------------------------------------------
+    # Backtest Strategy — so sánh model vs Buy & Hold
+    # ------------------------------------------------------------------
+
+    def backtest_strategy(self, actuals: np.ndarray,
+                          predictions: np.ndarray,
+                          freq: str = "monthly") -> dict:
+        """
+        Mô phỏng chiến lược giao dịch dựa trên tín hiệu model.
+
+        Chiến lược:
+          - Dự báo TĂNG → mua (long), nhận actual_return tháng đó
+          - Dự báo GIẢM → đứng ngoài (cash), return = 0
+        So sánh với Buy & Hold (luôn nắm giữ).
+
+        Metrics:
+          total_return      : lợi nhuận tích lũy cuối kỳ (%)
+          annual_return     : lợi nhuận trung bình mỗi năm (%)
+          sharpe_ratio      : return / risk (> 1 là tốt)
+          max_drawdown      : mức giảm tối đa từ đỉnh (%)
+          win_rate          : % tháng có lợi nhuận dương
+        """
+        unit   = "tháng" if freq == "monthly" else "ngày"
+        n_year = 12 if freq == "monthly" else 252
+
+        # ── Chiến lược model: chỉ nắm giữ khi dự báo TĂNG ──────────
+        model_returns = np.where(predictions > 0, actuals, 0.0)
+
+        # ── Buy & Hold: luôn nắm giữ ──────────────────────────────
+        bh_returns = actuals.copy()
+
+        def _metrics(rets, name):
+            cum   = np.cumprod(1 + rets) - 1          # tích lũy
+            total = cum[-1] * 100
+            ann   = ((1 + cum[-1]) ** (n_year / len(rets)) - 1) * 100
+            std   = np.std(rets) * np.sqrt(n_year)
+            sharpe = ann / (std * 100 + 1e-8)
+            # Max drawdown
+            wealth   = np.cumprod(1 + rets)
+            peak     = np.maximum.accumulate(wealth)
+            drawdown = (wealth - peak) / (peak + 1e-8)
+            mdd      = drawdown.min() * 100
+            win_rate = np.mean(rets > 0) * 100
+            return {
+                'name': name, 'cum_returns': cum,
+                'total_return': round(total, 2),
+                'annual_return': round(ann, 2),
+                'sharpe_ratio': round(sharpe, 3),
+                'max_drawdown': round(mdd, 2),
+                'win_rate': round(win_rate, 2),
+            }
+
+        m_stats = _metrics(model_returns, 'Model Strategy')
+        b_stats = _metrics(bh_returns,    'Buy & Hold')
+
+        # ── In kết quả ─────────────────────────────────────────────
+        print(f"\n{'='*60}")
+        print(f"  BACKTEST — Model Strategy vs Buy & Hold")
+        print(f"  (Dựa trên {len(actuals)} {unit} out-of-sample)")
+        print(f"{'='*60}")
+        print(f"  {'Chỉ số':<22} {'Model Strategy':>16} {'Buy & Hold':>12}")
+        print(f"  {'-'*52}")
+        metrics = [
+            ('Tổng lợi nhuận (%)',  'total_return'),
+            ('Lợi nhuận/năm (%)',   'annual_return'),
+            ('Sharpe Ratio',        'sharpe_ratio'),
+            ('Max Drawdown (%)',    'max_drawdown'),
+            ('Win Rate (%)',        'win_rate'),
+        ]
+        for label, key in metrics:
+            mv, bv = m_stats[key], b_stats[key]
+            better = '✓' if (key == 'max_drawdown' and mv > bv) is False and (
+                (key == 'max_drawdown' and mv > bv) or
+                (key != 'max_drawdown' and mv >= bv)
+            ) else ''
+            print(f"  {label:<22} {mv:>14.2f}   {bv:>10.2f}  {better}")
+        print(f"{'='*60}")
+
+        # ── Vẽ biểu đồ so sánh ─────────────────────────────────────
+        self._plot_backtest(m_stats, b_stats, freq)
+
+        return {'model': m_stats, 'buyhold': b_stats}
+
+    def _plot_backtest(self, m_stats: dict, b_stats: dict,
+                       freq: str = "monthly") -> None:
+        unit = "Tháng" if freq == "monthly" else "Ngày"
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+        # Biểu đồ 1: tăng trưởng vốn
+        ax = axes[0]
+        ax.plot((m_stats['cum_returns'] + 1) * 100,
+                label='Model Strategy', color='#C44E52', linewidth=2)
+        ax.plot((b_stats['cum_returns'] + 1) * 100,
+                label='Buy & Hold', color='#4C72B0',
+                linewidth=2, linestyle='--')
+        ax.axhline(100, color='gray', linewidth=0.8, linestyle=':')
+        ax.set_ylabel('Giá trị danh mục (vốn gốc = 100)')
+        ax.set_title(f'Tăng trưởng vốn — Model vs Buy & Hold ({unit}ly)')
+        ax.legend()
+        ax.grid(True, linestyle=':', alpha=0.5)
+
+        # Biểu đồ 2: so sánh metrics
+        ax2 = axes[1]
+        labels  = ['Lợi nhuận/năm\n(%)', 'Sharpe\nRatio', 'Win Rate\n(%)']
+        m_vals  = [m_stats['annual_return'],
+                   m_stats['sharpe_ratio'],
+                   m_stats['win_rate']]
+        b_vals  = [b_stats['annual_return'],
+                   b_stats['sharpe_ratio'],
+                   b_stats['win_rate']]
+        x = np.arange(len(labels))
+        w = 0.35
+        ax2.bar(x - w/2, m_vals, w, label='Model Strategy', color='#C44E52', alpha=0.8)
+        ax2.bar(x + w/2, b_vals, w, label='Buy & Hold',     color='#4C72B0', alpha=0.8)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(labels)
+        ax2.set_title('So sánh hiệu suất')
+        ax2.legend()
+        ax2.grid(axis='y', linestyle=':', alpha=0.5)
+
+        plt.tight_layout()
+        suffix = "_daily" if freq == "daily" else ""
+        fname  = f"backtest{suffix}.png"
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  Biểu đồ lưu tại: {fname}")
+
+    # ------------------------------------------------------------------
     # Evaluation & Comparison
     # ------------------------------------------------------------------
 

@@ -155,7 +155,15 @@ def main(freq: str = "monthly", use_cache: bool = True):
                 f"{res['da']:>10.2%}"
             )
 
-    # 7. Dự báo tháng tiếp theo
+    # 7. Backtest chiến lược — model vs Buy & Hold
+    print("\n--- 7. Backtest Strategy ---")
+    best = results.get('all') or results.get('lasso')
+    if best:
+        forecaster.backtest_strategy(
+            best['actuals'], best['predictions'], freq=freq
+        )
+
+    # 8. Dự báo tháng tiếp theo
     print("\n--- 7. Dự báo tháng tiếp theo ---")
     # Nhập giá VN-Index hiện tại (hoặc None nếu không biết)
     try:
