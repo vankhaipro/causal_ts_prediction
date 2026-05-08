@@ -93,6 +93,49 @@ class CausalForecaster:
         return df
 
     # ------------------------------------------------------------------
+    # Causal Discovery — VAR-LiNGAM (Paper 2)
+    # ------------------------------------------------------------------
+
+    def perform_causal_discovery_lingam(self, df, lags=3):
+        """
+        Chạy VAR-LiNGAM để tìm causal parents của target.
+
+        Khác PCMCI+ (conditional independence, Gaussian):
+        - LiNGAM giả định nhiễu Non-Gaussian → identify được cả
+          contemporaneous causal order
+        - Phù hợp hơn với ít data points (monthly ~100 điểm)
+        - Prune=True loại bỏ các link yếu tự động
+
+        Paper 2: Oliveira et al. 2024 — union với PCMCI+ features
+        cho feature set ổn định hơn qua các regime thị trường.
+        """
+        from lingam import VARLiNGAM
+
+        feature_names = df.columns.tolist()
+        target_idx    = feature_names.index(self.target_col)
+
+        print(f"  Chạy VAR-LiNGAM (lags={lags}, prune=True)...")
+        model = VARLiNGAM(lags=lags, criterion='bic', prune=True)
+        model.fit(df.values.astype(float))
+
+        # adjacency_matrices_: list độ dài lags, mỗi phần tử shape (n, n)
+        # A[i][j] != 0 → biến j là causal parent của biến i tại lag đó
+        lingam_parents = set()
+        for lag_idx, A in enumerate(model.adjacency_matrices_):
+            lag = lag_idx + 1
+            row = A[target_idx]          # hàng target
+            for j, coef in enumerate(row):
+                if abs(coef) > 1e-10 and feature_names[j] != self.target_col:
+                    lingam_parents.add(feature_names[j])
+                    print(f"    LiNGAM: {feature_names[j]}(t-{lag}) "
+                          f"→ {self.target_col}  coef={coef:.4f}")
+
+        if not lingam_parents:
+            print("  VAR-LiNGAM không tìm được causal parents.")
+
+        return list(lingam_parents)
+
+    # ------------------------------------------------------------------
     # Causal Discovery — PCMCI+
     # ------------------------------------------------------------------
 

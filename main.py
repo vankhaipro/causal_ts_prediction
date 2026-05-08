@@ -80,11 +80,22 @@ def main(freq: str = "monthly", use_cache: bool = True):
     # 4. Trích xuất causal features + visualize
     print("\n--- 4. Causal Features & Graph (Phase 5) ---")
     causal_pairs = forecaster.extract_features()
-    print(f"  Số features nhân quả: {len(forecaster.selected_features)}")
+    print(f"  PCMCI+ features: {forecaster.selected_features}")
     forecaster.visualize_graph(freq=freq)
     forecaster.plot_effect_heatmap(freq=freq)
     forecaster.plot_lag_effects(freq=freq)
     impact_df = forecaster.news_impact_report()
+
+    # 4b. VAR-LiNGAM — Paper 2: union với PCMCI+ để feature set ổn định hơn
+    print("\n--- 4b. VAR-LiNGAM Causal Discovery ---")
+    lingam_features = forecaster.perform_causal_discovery_lingam(
+        df_pre, lags=cfg["tau_max"]
+    )
+    print(f"  LiNGAM features : {lingam_features}")
+
+    union_features = list(set(forecaster.selected_features) | set(lingam_features))
+    print(f"  Union features  : {union_features}")
+    forecaster.selected_features = union_features  # ghi đè để compare_models dùng
 
     # 5. So sánh các model với rolling window
     window = min(cfg["window_size"], len(df_pre) // 3)
