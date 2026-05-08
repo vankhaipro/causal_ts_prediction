@@ -647,6 +647,123 @@ class CausalForecaster:
         return float(pred)
 
     # ------------------------------------------------------------------
+    # Predict Next Month — kết hợp Causal Ridge + Causal Logistic
+    # ------------------------------------------------------------------
+
+    def predict_next_month(self, df: pd.DataFrame,
+                           window_size: int = 60,
+                           current_price: float = None) -> dict:
+        """
+        Dự báo tháng tiếp theo bằng cách kết hợp:
+          - Causal Ridge   → ước tính độ lớn log return
+          - Causal Logistic → xác nhận chiều tăng/giảm (60% DA)
+
+        Parameters
+        ----------
+        df           : DataFrame đã clean (stationary, no NaN)
+        window_size  : số tháng gần nhất để train
+        current_price: giá VN-Index hiện tại (để tính giá dự báo)
+
+        Returns dict gồm:
+          direction      : 'TĂNG' / 'GIẢM'
+          confidence     : xác suất chiều dự báo (0-1)
+          pred_return    : log return dự báo từ Ridge
+          pred_price     : giá dự báo (nếu có current_price)
+          signal         : 'MUA' / 'BÁN' / 'CHỜ'
+          features_used  : danh sách features causal
+        """
+        from sklearn.linear_model import LogisticRegressionCV, Ridge
+        from sklearn.model_selection import TimeSeriesSplit
+
+        feature_cols = [c for c in self.selected_features if c in df.columns]
+        if not feature_cols:
+            feature_cols = [c for c in df.columns if c != self.target_col]
+
+        # Shift-1: dùng giá trị tháng hiện tại để dự báo tháng tới
+        df_lag = df[feature_cols].shift(1).copy()
+        df_lag[self.target_col] = df[self.target_col]
+        df_lag = df_lag.dropna()
+
+        n = len(df_lag)
+        ws = min(window_size, n - 1)
+
+        X_train = df_lag[feature_cols].values[-ws:]
+        y_train = df_lag[self.target_col].values[-ws:]
+        y_dir   = (y_train > 0).astype(int)
+
+        # X_next = giá trị features tháng MỚI NHẤT (chưa shift)
+        X_next = df[feature_cols].values[-1:].copy()
+
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_next_s  = scaler.transform(X_next)
+
+        # --- Causal Ridge: dự báo return ---
+        ridge = Ridge(alpha=1.0)
+        ridge.fit(X_train_s, y_train)
+        pred_return = float(ridge.predict(X_next_s)[0])
+
+        # --- Causal Logistic: dự báo chiều + confidence ---
+        direction, confidence = 'TĂNG', 0.5
+        if len(np.unique(y_dir)) >= 2:
+            tscv = TimeSeriesSplit(n_splits=3)
+            clf = LogisticRegressionCV(
+                Cs=np.logspace(-3, 2, 10),
+                cv=tscv, scoring='accuracy',
+                penalty='l2', solver='lbfgs',
+                max_iter=500, random_state=42,
+            )
+            clf.fit(X_train_s, y_dir)
+            proba     = clf.predict_proba(X_next_s)[0]   # [P(giảm), P(tăng)]
+            pred_dir  = clf.predict(X_next_s)[0]
+            direction = 'TĂNG' if pred_dir == 1 else 'GIẢM'
+            confidence = float(proba[pred_dir])
+
+        # Nếu Ridge và Logistic mâu thuẫn → hạ confidence, signal CHỜ
+        ridge_dir   = 'TĂNG' if pred_return > 0 else 'GIẢM'
+        consistent  = (ridge_dir == direction)
+
+        if not consistent:
+            signal = 'CHỜ'
+        elif confidence >= 0.60:
+            signal = 'MUA' if direction == 'TĂNG' else 'BÁN'
+        else:
+            signal = 'CHỜ'
+
+        # Giá dự báo
+        pred_price = None
+        if current_price and current_price > 0:
+            pred_price = round(current_price * np.exp(pred_return), 2)
+
+        result = {
+            'direction':    direction,
+            'confidence':   round(confidence, 4),
+            'pred_return':  round(pred_return * 100, 2),   # % thay vì log
+            'pred_price':   pred_price,
+            'signal':       signal,
+            'ridge_dir':    ridge_dir,
+            'consistent':   consistent,
+            'features_used': feature_cols,
+        }
+
+        # In đẹp
+        print(f"\n{'='*55}")
+        print(f"  DỰ BÁO THÁNG TIẾP THEO — VN-Index")
+        print(f"{'='*55}")
+        print(f"  Chiều dự báo  : {direction}  (confidence: {confidence:.1%})")
+        print(f"  Return dự báo : {pred_return*100:+.2f}%")
+        if pred_price:
+            print(f"  Giá hiện tại  : {current_price:,.0f}")
+            print(f"  Giá dự báo    : {pred_price:,.0f}")
+        print(f"  Đồng thuận    : Ridge={'TĂNG' if pred_return>0 else 'GIẢM'} | "
+              f"Logistic={direction} → {'✓ Nhất quán' if consistent else '✗ Mâu thuẫn'}")
+        print(f"  Khuyến nghị   : {'🟢 '+signal if signal=='MUA' else '🔴 '+signal if signal=='BÁN' else '🟡 '+signal}")
+        print(f"  Features dùng : {feature_cols}")
+        print(f"{'='*55}")
+
+        return result
+
+    # ------------------------------------------------------------------
     # Evaluation & Comparison
     # ------------------------------------------------------------------
 
@@ -712,6 +829,45 @@ class CausalForecaster:
 
         return np.array(actuals), np.array(predictions)
 
+    def _rolling_forecast_xgb(self, df, feature_cols, window_size=60):
+        """Rolling window XGBoost — bắt quan hệ phi tuyến (Nhóm 1)."""
+        try:
+            from xgboost import XGBRegressor
+        except ImportError:
+            print("  [WARNING] xgboost chưa cài. Bỏ qua XGBoost.")
+            return None, None
+
+        df_lag = df[feature_cols].shift(1).copy()
+        df_lag[self.target_col] = df[self.target_col]
+        df_lag = df_lag.dropna()
+
+        y = df_lag[self.target_col].values
+        X = df_lag[feature_cols].values
+
+        predictions, actuals = [], []
+        for i in range(window_size, len(df_lag)):
+            X_train, y_train = X[i - window_size:i], y[i - window_size:i]
+            X_test = X[i:i + 1]
+
+            scaler = StandardScaler()
+            X_train_s = scaler.fit_transform(X_train)
+            X_test_s  = scaler.transform(X_test)
+
+            model = XGBRegressor(
+                n_estimators=100,
+                max_depth=3,          # shallow — tránh overfit trên data nhỏ
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                verbosity=0,
+            )
+            model.fit(X_train_s, y_train)
+            predictions.append(model.predict(X_test_s)[0])
+            actuals.append(y[i])
+
+        return np.array(actuals), np.array(predictions)
+
     def compare_models(self, df, window_size=60, freq: str = "monthly",
                        use_lstm: bool = False, lstm_epochs: int = 20):
         """
@@ -720,21 +876,28 @@ class CausalForecaster:
           2. LASSO Ridge
           3. Causal Ridge (PCMCI+)
           4. Causal Logistic (PCMCI+ features) — tối ưu trực tiếp DA
+          5. Causal XGBoost — phi tuyến, bắt momentum
           5. Causal LSTM (PCMCI+ features, nếu use_lstm=True)
         """
         all_cols = [c for c in df.columns if c != self.target_col]
 
-        print("\n[1/4] All-features Ridge")
+        print("\n[1/5] All-features Ridge")
         act, pred_all = self._rolling_forecast(df, all_cols, window_size)
         r_all = self.evaluate(act, pred_all, 'All-features Ridge')
 
-        print("\n[2/4] LASSO Ridge")
+        print("\n[2/5] All-features XGBoost (phi tuyến, tất cả features)")
+        r_all_xgb = None
+        act_axgb, pred_axgb = self._rolling_forecast_xgb(df, all_cols, window_size)
+        if act_axgb is not None:
+            r_all_xgb = self.evaluate(act_axgb, pred_axgb, 'All-features XGBoost')
+
+        print("\n[3/6] LASSO Ridge")
         df_lasso  = self.reduce_dimensions(df, method='lasso')
         lasso_cols = [c for c in df_lasso.columns if c != self.target_col]
         _, pred_lasso = self._rolling_forecast(df, lasso_cols, window_size)
         r_lasso = self.evaluate(act, pred_lasso, 'LASSO Ridge')
 
-        print("\n[3/4] Causal Ridge (PCMCI+)")
+        print("\n[4/6] Causal Ridge (PCMCI+)")
         r_causal = None
         if self.selected_features:
             _, pred_causal = self._rolling_forecast(df, self.selected_features, window_size)
@@ -742,12 +905,20 @@ class CausalForecaster:
         else:
             print("  Không tìm được causal features.")
 
-        print("\n[4/4] Causal Logistic (PCMCI+ — tối ưu DA trực tiếp)")
+        print("\n[5/6] Causal Logistic (PCMCI+ — tối ưu DA trực tiếp)")
         r_clf = None
         clf_cols = self.selected_features if self.selected_features else lasso_cols
         if clf_cols:
             _, pred_clf = self._rolling_forecast_clf(df, clf_cols, window_size)
             r_clf = self.evaluate(act, pred_clf, 'Causal Logistic')
+
+        print("\n[6/6] Causal XGBoost (phi tuyến + momentum)")
+        r_xgb = None
+        xgb_cols = self.selected_features if self.selected_features else lasso_cols
+        if xgb_cols:
+            act_xgb, pred_xgb = self._rolling_forecast_xgb(df, xgb_cols, window_size)
+            if act_xgb is not None:
+                r_xgb = self.evaluate(act_xgb, pred_xgb, 'Causal XGBoost')
 
         r_lstm = None
         if use_lstm and TORCH_AVAILABLE and self.selected_features:
@@ -762,7 +933,7 @@ class CausalForecaster:
             if act_lstm is not None:
                 r_lstm = self.evaluate(act_lstm, pred_lstm, 'Causal LSTM (PCMCI+)')
 
-        results = {'all': r_all, 'lasso': r_lasso, 'causal': r_causal, 'clf': r_clf, 'lstm': r_lstm}
+        results = {'all': r_all, 'all_xgb': r_all_xgb, 'lasso': r_lasso, 'causal': r_causal, 'clf': r_clf, 'xgb': r_xgb, 'lstm': r_lstm}
         self._plot_comparison(results, act, freq=freq)
         return results
 

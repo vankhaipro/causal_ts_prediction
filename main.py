@@ -8,8 +8,41 @@ Cách chạy:
 """
 
 import sys
+import numpy as np
+import pandas as pd
 from causal_forecaster import CausalForecaster
 from data_loader import load_dataset
+
+
+def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Nhóm 1 — thêm autoregression + technical indicators từ data giá có sẵn.
+    Tất cả tính với lag để tránh look-ahead bias.
+    """
+    df = df.copy()
+    ret = df["VNINDEX_Return"]
+
+    # 1. Autoregression lag 1-3 (momentum ngắn hạn)
+    df["VNINDEX_lag1"] = ret.shift(1)
+    df["VNINDEX_lag2"] = ret.shift(2)
+    df["VNINDEX_lag3"] = ret.shift(3)
+
+    # 2. Momentum 3 tháng (tổng return 3 tháng trước)
+    df["VNINDEX_mom3"] = ret.shift(1).rolling(3).sum()
+
+    # 3. Volatility 3 tháng (độ biến động gần đây)
+    df["VNINDEX_vol3"] = ret.shift(1).rolling(3).std()
+
+    # 4. RSI-style momentum: tỷ lệ tháng tăng / tổng tháng (6 tháng)
+    up   = ret.shift(1).rolling(6).apply(lambda x: (x > 0).sum())
+    df["VNINDEX_rsi6"] = up / 6.0
+
+    # 5. Trend signal: MA3 so với MA6 (cross signal)
+    ma3 = ret.shift(1).rolling(3).mean()
+    ma6 = ret.shift(1).rolling(6).mean()
+    df["VNINDEX_trend"] = (ma3 - ma6)
+
+    return df
 
 
 # ------------------------------------------------------------------
@@ -56,6 +89,13 @@ def main(freq: str = "monthly", use_cache: bool = True):
     if non_stat:
         print(f"  → Diff các cột non-stationary: {non_stat}")
         df_clean[non_stat] = df_clean[non_stat].diff()
+
+    # 2b+. Thêm autoregression + technical indicators (Nhóm 1)
+    df_clean = add_technical_features(df_clean)
+    new_cols = ["VNINDEX_lag1","VNINDEX_lag2","VNINDEX_lag3",
+                "VNINDEX_mom3","VNINDEX_vol3","VNINDEX_rsi6","VNINDEX_trend"]
+    print(f"  → Thêm {len(new_cols)} technical features: {new_cols}")
+
     before = len(df_clean)
     df_clean = df_clean.dropna()
     print(f"  → Sau khi dropna: {before} → {len(df_clean)} hàng")
@@ -114,6 +154,23 @@ def main(freq: str = "monthly", use_cache: bool = True):
                 f"{res['mae']:>10.6f} "
                 f"{res['da']:>10.2%}"
             )
+
+    # 7. Dự báo tháng tiếp theo
+    print("\n--- 7. Dự báo tháng tiếp theo ---")
+    # Nhập giá VN-Index hiện tại (hoặc None nếu không biết)
+    try:
+        import vnstock as vns
+        vnindex = vns.Vnstock().stock(symbol='VNINDEX', source='VCI')
+        price_df = vnindex.quote.history(start='2026-01-01', end='2026-04-30', interval='1M')
+        current_price = float(price_df['close'].iloc[-1]) if not price_df.empty else None
+    except Exception:
+        current_price = None
+
+    forecaster.predict_next_month(
+        df_pre,
+        window_size=window,
+        current_price=current_price,
+    )
 
 
 if __name__ == "__main__":
