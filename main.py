@@ -60,11 +60,19 @@ def main(freq: str = "monthly", use_cache: bool = True):
     df_clean = df_clean.dropna()
     print(f"  → Sau khi dropna: {before} → {len(df_clean)} hàng")
 
-    # 3. Causal discovery — PCMCI+
+    # 2c. LASSO pre-selection — giảm features trước khi PCMCI+
+    # Lý do: 31 features × 98 điểm monthly → statistical power thấp
+    # LASSO chọn ~10 features → PCMCI+ có power tìm causal links tốt hơn
+    print(f"\n--- 2c. LASSO Pre-selection (31 → ~10 features) ---")
+    df_pre = forecaster.reduce_dimensions(df_clean, method='lasso')
+    pre_cols = [c for c in df_pre.columns if c != forecaster.target_col]
+    print(f"  → Còn lại: {len(pre_cols)} features: {pre_cols}")
+
+    # 3. Causal discovery — PCMCI+ trên tập features đã lọc
     #    tau_min=1 đảm bảo chỉ tìm X(t-τ) → Y(t), không look-ahead bias.
     print(f"\n--- 3. Causal Discovery (PCMCI+, tau_max={cfg['tau_max']}) ---")
     forecaster.perform_causal_discovery(
-        df_clean,
+        df_pre,
         tau_max=cfg["tau_max"],
         pc_alpha=cfg["pc_alpha"],
     )
@@ -78,10 +86,10 @@ def main(freq: str = "monthly", use_cache: bool = True):
     forecaster.plot_lag_effects(freq=freq)
     impact_df = forecaster.news_impact_report()
 
-    # 5. So sánh 3 baselines với rolling window
-    window = min(cfg["window_size"], len(df_clean) // 3)
+    # 5. So sánh các model với rolling window
+    window = min(cfg["window_size"], len(df_pre) // 3)
     print(f"\n--- 5. Model Comparison (Rolling Window = {window} {cfg['unit']}) ---")
-    results = forecaster.compare_models(df_clean, window_size=window, freq=freq)
+    results = forecaster.compare_models(df_pre, window_size=window, freq=freq)
 
     # 6. Tổng kết
     print("\n=== KẾT QUẢ TỔNG KẾT ===")
