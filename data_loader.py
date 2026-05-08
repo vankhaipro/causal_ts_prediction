@@ -243,8 +243,14 @@ def load_news_features(freq: str = "daily") -> pd.DataFrame:
     df = pd.read_csv(news_path, index_col=0, parse_dates=True)
     df.index = pd.to_datetime(df.index).normalize()
 
+    # Bỏ sentiment_pos_pct / sentiment_neg_pct nếu đã có prob_mean tương ứng
+    # (tránh multicollinearity cho PCMCI+: corr(neg_pct, neg_prob_mean) ≈ 0.97)
+    redundant = []
+    if "neg_prob_mean" in df.columns:
+        redundant += ["sentiment_pos_pct", "sentiment_neg_pct"]
+    df = df.drop(columns=[c for c in redundant if c in df.columns])
+
     if freq == "monthly":
-        # Resample về tháng (mean), align index về month-end
         df = df.resample("ME").mean()
 
     print(f"  [News] {df.shape}  {df.index[0].date()} → {df.index[-1].date()}")
